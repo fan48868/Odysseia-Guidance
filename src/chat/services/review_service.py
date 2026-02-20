@@ -29,6 +29,7 @@ from src.chat.features.work_game.services.work_db_service import WorkDBService
 log = logging.getLogger(__name__)
 
 # --- 审核配置 ---
+# 注意：实际阈值逻辑已在 _get_review_settings 中被强制覆盖为 1
 REVIEW_SETTINGS = chat_config.WORLD_BOOK_CONFIG["review_settings"]
 VOTE_EMOJI = REVIEW_SETTINGS["vote_emoji"]
 REJECT_EMOJI = REVIEW_SETTINGS["reject_emoji"]
@@ -53,6 +54,30 @@ class ReviewService:
         except sqlite3.Error as e:
             log.error(f"连接到世界书数据库失败: {e}", exc_info=True)
             return None
+
+    def _get_review_settings(self, entry_type: str) -> dict:
+        """
+        根据条目类型获取对应的审核配置。
+        [修改] 强制将通过阈值设置为 1，实现“1个✅立马通过”。
+        """
+        # 1. 获取原始配置
+        if entry_type == "community_member":
+            original_settings = chat_config.WORLD_BOOK_CONFIG.get(
+                "personal_profile_review_settings", REVIEW_SETTINGS
+            )
+        elif entry_type == "work_event":
+            original_settings = chat_config.WORLD_BOOK_CONFIG.get(
+                "work_event_review_settings", REVIEW_SETTINGS
+            )
+        else:
+            original_settings = REVIEW_SETTINGS
+        
+        # 2. 创建副本并强制覆盖阈值
+        settings = original_settings.copy()
+        settings["approval_threshold"] = 1       # 结算时通过的阈值
+        settings["instant_approval_threshold"] = 1 # 立即通过的阈值
+        
+        return settings
 
     async def start_review(self, pending_id: int):
         """根据 pending_id 发起一个公开审核流程"""
@@ -120,10 +145,13 @@ class ReviewService:
         self, entry: sqlite3.Row, data: Dict[str, Any], proposer: discord.User
     ) -> discord.Embed:
         """构建通用知识提交的审核 Embed"""
-        duration = REVIEW_SETTINGS["review_duration_minutes"]
-        approval_threshold = REVIEW_SETTINGS["approval_threshold"]
-        instant_approval_threshold = REVIEW_SETTINGS["instant_approval_threshold"]
-        rejection_threshold = REVIEW_SETTINGS["rejection_threshold"]
+        # [修改] 使用统一的方法获取配置，确保显示的阈值也是 1
+        settings = self._get_review_settings("general_knowledge")
+        
+        duration = settings["review_duration_minutes"]
+        approval_threshold = settings["approval_threshold"]
+        instant_approval_threshold = settings["instant_approval_threshold"]
+        rejection_threshold = settings["rejection_threshold"]
         title = data.get("title", data.get("name", "未知标题"))
         content = data.get("content_text", data.get("description", ""))
 
@@ -294,7 +322,8 @@ class ReviewService:
         self, entry: sqlite3.Row, data: Dict[str, Any], proposer: discord.User
     ) -> discord.Embed:
         """构建自定义工作事件的审核 Embed"""
-        review_settings = chat_config.WORLD_BOOK_CONFIG["work_event_review_settings"]
+        # [修改] 使用统一的方法获取配置，确保显示的阈值也是 1
+        review_settings = self._get_review_settings("work_event")
         duration = review_settings["review_duration_minutes"]
 
         embed = discord.Embed(
@@ -381,18 +410,6 @@ class ReviewService:
             f"检测到对审核消息 (ID: {message.id}) 的投票，解析出 pending_id: {pending_id}"
         )
         await self.process_vote(pending_id, message)
-
-    def _get_review_settings(self, entry_type: str) -> dict:
-        """根据条目类型获取对应的审核配置"""
-        if entry_type == "community_member":
-            return chat_config.WORLD_BOOK_CONFIG.get(
-                "personal_profile_review_settings", REVIEW_SETTINGS
-            )
-        elif entry_type == "work_event":
-            return chat_config.WORLD_BOOK_CONFIG.get(
-                "work_event_review_settings", REVIEW_SETTINGS
-            )
-        return REVIEW_SETTINGS
 
     async def process_vote(self, pending_id: int, message: discord.Message):
         """处理投票逻辑，检查是否达到阈值"""

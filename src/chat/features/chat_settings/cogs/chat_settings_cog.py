@@ -27,14 +27,20 @@ class ChatSettingsCog(commands.Cog):
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ):
         if isinstance(error, app_commands.CheckFailure):
-            await interaction.response.send_message(
-                "你没有权限使用此命令。", ephemeral=True
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "你没有权限使用此命令。", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "你没有权限使用此命令。", ephemeral=True
+                )
         else:
             # 对于其他错误，可以在这里添加日志记录或通用错误消息
-            await interaction.response.send_message(
-                "执行命令时发生错误。", ephemeral=True
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send("执行命令时发生错误。", ephemeral=True)
+            else:
+                await interaction.response.send_message("执行命令时发生错误。", ephemeral=True)
             print(f"Error in ChatSettingsCog: {error}")
 
     @app_commands.command(name="聊天设置", description="打开聊天功能设置面板")

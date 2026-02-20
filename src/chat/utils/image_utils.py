@@ -7,7 +7,7 @@ log = logging.getLogger(__name__)
 
 
 # --- 压缩策略常量 ---
-NO_COMPRESSION_THRESHOLD_BYTES = 10 * 1024 * 1024  # 10 MB (小于此值不执行迭代压缩)
+NO_COMPRESSION_THRESHOLD_BYTES = 7 * 1024 * 1024  # 7 MB (小于此值不执行迭代压缩)
 MAX_IMAGE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB (硬性物理上限)
 TARGET_IMAGE_SIZE_BYTES = 4 * 1024 * 1024  # 4 MB  (大于10MB的图片期望压缩到的目标大小)
 MAX_IMAGE_DIMENSION = 4096  # 4096 像素 (最大尺寸)
@@ -59,7 +59,7 @@ def sanitize_image(image_bytes: bytes) -> Tuple[bytes, str]:
             # --- 3. 根据原始大小选择不同策略 ---
             if original_byte_size < NO_COMPRESSION_THRESHOLD_BYTES:
                 # --- 策略A: 小于10MB，高质量保存 ---
-                log.info("图片小于10MB，执行高质量保存。")
+                log.info("图片小于7MB，执行高质量保存。")
                 output_buffer = io.BytesIO()
                 img.save(output_buffer, format="WEBP", quality=HIGH_QUALITY)
                 processed_bytes = output_buffer.getvalue()
@@ -67,7 +67,7 @@ def sanitize_image(image_bytes: bytes) -> Tuple[bytes, str]:
                 output_buffer = None
             else:
                 # --- 策略B: 大于等于10MB，尽力压缩 ---
-                log.info("图片大于等于10MB，执行迭代压缩。")
+                log.info("图片大于等于7MB，执行迭代压缩。")
                 quality = INITIAL_QUALITY
                 while quality >= MIN_QUALITY:
                     output_buffer = io.BytesIO()

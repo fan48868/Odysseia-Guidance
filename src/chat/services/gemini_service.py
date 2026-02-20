@@ -2,7 +2,7 @@
 
 import os
 import logging
-from typing import Optional, Dict, List, Callable, Any
+from typing import Optional, Dict, List, Callable, Any, Tuple
 import asyncio
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
@@ -67,32 +67,62 @@ if not invalid_key_logger.handlers:
 
 def _api_key_handler(func: Callable) -> Callable:
     """
-    一个装饰器，用于优雅地处理 API 密钥的获取、释放和重试逻辑。
-    实现了两层重试：
-    1. 外层循环：持续获取可用密钥，如果所有密钥都在冷却，则会等待。
-    2. 内层循环：对获取到的单个密钥，在遇到可重试错误时，会根据配置进行多次尝试。
+    双轨制装饰器：
+    1. generate_embedding -> 强制使用 GOOGLE_API_KEYS_LIST (官方直连)
+    2. 其他方法 (聊天) -> 优先使用 CUSTOM_GEMINI_URL (自定义通道)
     """
-
     @wraps(func)
     async def wrapper(self: "GeminiService", *args, **kwargs):
+        # [逻辑分流] 判断当前任务类型
+        is_embedding_task = (func.__name__ == "generate_embedding")
+        
+        # [逻辑分流] 决定是否使用自定义通道 (非向量化 且 配置了自定义参数)
+        use_custom_channel = (not is_embedding_task) and (self.custom_chat_url and self.custom_chat_key)
+
+        # 定义一个简单的类来模拟 key_obj，用于自定义通道场景
+        class MockKeyObj:
+            def __init__(self, k): 
+                self.key = k
+                self.consecutive_failures = 0
+
         while True:
             key_obj = None
+            client = None
+            
             try:
-                key_obj = await self.key_rotation_service.acquire_key()
-                client = self._create_client_with_key(key_obj.key)
+                # --- [核心修改点] 根据通道类型创建不同的 Client ---
+                if use_custom_channel:
+                    # 【通道 A：聊天】走自定义中转
+                    key_obj = MockKeyObj(self.custom_chat_key)
+                    # 强制使用自定义 URL
+                    http_options = types.HttpOptions(base_url=self.custom_chat_url)
+                    client = genai.Client(api_key=self.custom_chat_key, http_options=http_options)
+                    # log.info(f"使用自定义通道调用 {func.__name__}")
+                    
+                else:
+                    # 【通道 B：向量】走官方直连 (或者是聊天回退)
+                    # 从轮换服务获取官方 Key
+                    key_obj = await self.key_rotation_service.acquire_key()
+                    # 强制直连 (不传 http_options，默认就是 google 官方)
+                    client = genai.Client(api_key=key_obj.key)
+                    # log.info(f"使用官方通道调用 {func.__name__}")
 
-                failure_penalty = 25  # 默认的失败惩罚
+                # --- 下面的逻辑保留原有的重试和错误处理框架 ---
+                
+                failure_penalty = 25
                 key_should_be_cooled_down = False
                 key_is_invalid = False
 
                 max_attempts = app_config.API_RETRY_CONFIG["MAX_ATTEMPTS_PER_KEY"]
+                # 如果是自定义通道，其实不需要循环尝试不同 Key，但为了复用代码结构，还是保留循环
                 for attempt in range(max_attempts):
                     try:
-                        log.info(
-                            f"使用密钥 ...{key_obj.key[-4:]} (尝试 {attempt + 1}/{max_attempts}) 调用 {func.__name__}"
-                        )
+                        # 只有官方通道才需要打印详细的 Key 轮换日志
+                        if not use_custom_channel:
+                            log.info(
+                                f"使用密钥 ...{key_obj.key[-4:]} (尝试 {attempt + 1}/{max_attempts}) 调用 {func.__name__}"
+                            )
 
-                        # 将 client 作为关键字参数传递给原始函数
                         kwargs["client"] = client
                         result = await func(self, *args, **kwargs)
 
@@ -111,120 +141,74 @@ def _api_key_handler(func: Callable) -> Callable:
 
                         if is_blocked_by_safety:
                             log.warning(
-                                f"密钥 ...{key_obj.key[-4:]} 因安全策略被阻止 (原因: {result.prompt_feedback.block_reason if result.prompt_feedback else '未知'})。将进入冷却且不扣分。"
+                                f"安全策略拦截: {result.prompt_feedback.block_reason if result.prompt_feedback else '未知'}。"
                             )
-                            failure_penalty = 0  # 明确设置为0，不扣分
+                            failure_penalty = 0
                             key_should_be_cooled_down = True
                             break
 
-                        await self.key_rotation_service.release_key(
-                            key_obj.key, success=True, safety_penalty=safety_penalty
-                        )
+                        # [重要] 只有官方 Key 才需要释放回池子
+                        if not use_custom_channel:
+                            await self.key_rotation_service.release_key(
+                                key_obj.key, success=True, safety_penalty=safety_penalty
+                            )
                         return result
 
-                    except (
-                        genai_errors.ClientError,
-                        genai_errors.ServerError,
-                    ) as e:
+                    except (genai_errors.ClientError, genai_errors.ServerError) as e:
                         error_str = str(e)
                         match = re.match(r"(\d{3})", error_str)
                         status_code = int(match.group(1)) if match else None
-
+                        
+                        # 简单的可重试判断
                         is_retryable = status_code in [429, 503]
-                        if (
-                            not is_retryable
-                            and isinstance(e, genai_errors.ServerError)
-                            and "503" in error_str
-                        ):
-                            is_retryable = True
-                            status_code = 503
+                        if isinstance(e, genai_errors.ServerError) and "503" in error_str:
+                             is_retryable = True
 
                         if is_retryable:
-                            log.warning(
-                                f"密钥 ...{key_obj.key[-4:]} 遇到可重试错误 (状态码: {status_code})。"
-                            )
+                            log.warning(f"可重试错误 ({status_code})")
                             if attempt < max_attempts - 1:
-                                delay = app_config.API_RETRY_CONFIG[
-                                    "RETRY_DELAY_SECONDS"
-                                ]
-                                log.info(f"等待 {delay} 秒后重试。")
-                                await asyncio.sleep(delay)
+                                await asyncio.sleep(1) # 简单等待
                             else:
-                                log.warning(
-                                    f"密钥 ...{key_obj.key[-4:]} 的所有 {max_attempts} 次重试均失败。将进入冷却。"
-                                )
-                                # --- 渐进式惩罚逻辑 ---
-                                base_penalty = 10
-                                consecutive_failures = (
-                                    key_obj.consecutive_failures + 1
-                                )  # +1 是因为本次失败也要计算在内
-                                failure_penalty = base_penalty * consecutive_failures
-                                log.warning(
-                                    f"密钥 ...{key_obj.key[-4:]} 已连续失败 {consecutive_failures} 次。"
-                                    f"本次惩罚分值: {failure_penalty}"
-                                )
                                 key_should_be_cooled_down = True
-
-                        elif status_code == 403 or (
-                            status_code == 400
-                            and "API_KEY_INVALID" in error_str.upper()
-                        ):
-                            log.error(
-                                f"密钥 ...{key_obj.key[-4:]} 无效 (状态码: {status_code})。将施加毁灭性惩罚。"
-                            )
-                            failure_penalty = 101  # 毁灭性惩罚
-                            key_should_be_cooled_down = True
-                            break  # 直接跳出重试循环
-
+                        
+                        elif status_code in [400, 403] and "API_KEY" in str(e).upper():
+                             log.error(f"密钥无效 ({status_code})")
+                             key_is_invalid = True # 标记为无效，触发外层循环换 Key (仅限官方)
+                             failure_penalty = 101
+                             key_should_be_cooled_down = True
+                             break
                         else:
-                            log.error(
-                                f"使用密钥 ...{key_obj.key[-4:]} 时发生意外的致命API错误 (状态码: {status_code}): {e}",
-                                exc_info=True,
-                            )
-                            if isinstance(e, genai_errors.ServerError):
-                                # 对于服务器错误，也采用渐进式惩罚
-                                base_penalty = 15  # 服务器错误的基础惩罚可以稍高
-                                consecutive_failures = key_obj.consecutive_failures + 1
-                                failure_penalty = base_penalty * consecutive_failures
-                                log.warning(
-                                    f"密钥 ...{key_obj.key[-4:]} 遭遇服务器错误，已连续失败 {consecutive_failures} 次。"
-                                    f"本次惩罚分值: {failure_penalty}"
-                                )
-                                key_should_be_cooled_down = True
-                                break
-                            else:
-                                await self.key_rotation_service.release_key(
-                                    key_obj.key, success=True
-                                )
-                                return (
-                                    "抱歉，AI服务遇到了一个意料之外的错误，请稍后再试。"
-                                )
-
-                    except Exception as e:
-                        log.error(
-                            f"使用密钥 ...{key_obj.key[-4:]} 时发生未知错误: {e}",
-                            exc_info=True,
-                        )
-                        await self.key_rotation_service.release_key(
-                            key_obj.key, success=True
-                        )
-                        if func.__name__ == "generate_embedding":
-                            return None
-                        return "呜哇，有点晕嘞，等我休息一会儿 <伤心>"
+                            # 其他错误
+                            log.error(f"API调用发生错误: {e}", exc_info=True)
+                            # 如果是自定义通道报错，直接返回错误提示，不再尝试轮换
+                            if use_custom_channel:
+                                return "服务连接失败，请稍后再试。"
+                                
+                            await self.key_rotation_service.release_key(key_obj.key, success=True)
+                            if func.__name__ == "generate_embedding":
+                                return None
+                            return "呜哇，有点晕嘞，等我休息一会儿 <伤心>"
 
                 if key_is_invalid:
-                    continue
+                    if use_custom_channel:
+                         return "配置的自定义 API Key 无效。"
+                    continue # 官方通道：换下一个 Key 重试
 
                 if key_should_be_cooled_down:
-                    await self.key_rotation_service.release_key(
-                        key_obj.key, success=False, failure_penalty=failure_penalty
-                    )
+                    if not use_custom_channel:
+                        await self.key_rotation_service.release_key(
+                            key_obj.key, success=False, failure_penalty=failure_penalty
+                        )
+                    else:
+                        # 自定义通道冷却：简单休眠一下
+                        await asyncio.sleep(2)
 
             except NoAvailableKeyError:
-                log.error(
-                    "所有API密钥均不可用，且 acquire_key 未能成功等待。这是异常情况。"
-                )
+                log.error("所有官方 API 密钥均不可用。")
                 return "啊啊啊服务器要爆炸啦！现在有点忙不过来，你过一会儿再来找我玩吧！<生气>"
+            except Exception as outer_e:
+                log.error(f"严重未知错误: {outer_e}", exc_info=True)
+                return "系统发生严重错误。"
 
     return wrapper
 
@@ -242,6 +226,12 @@ class GeminiService:
 
     def __init__(self):
         self.bot = None  # 用于存储 Discord Bot 实例
+        self.custom_chat_url = os.getenv("CUSTOM_GEMINI_URL")
+        self.custom_chat_key = os.getenv("CUSTOM_GEMINI_API_KEY")
+        if self.custom_chat_url and self.custom_chat_key:
+            log.info(f"✅ 已启用自定义聊天通道: {self.custom_chat_url}")
+        else:
+            log.info("ℹ️ 未检测到完整的自定义聊天配置，将回退到官方 API。")
 
         # --- (新) SDK 底层调试日志 ---
         # 根据最新指南 (2025)，开启此选项可查看详细的 HTTP 请求/响应
@@ -431,10 +421,15 @@ class GeminiService:
                     buffered = io.BytesIO()
                     part_item.save(buffered, format="PNG")
                     img_bytes = buffered.getvalue()
+                    try:
+                        img_bytes, mime_type = sanitize_image(img_bytes)
+                    except Exception as e:
+                        log.error(f"图片处理失败: {e}")
+                        mime_type = "image/png"
                     processed_parts.append(
                         types.Part(
                             inline_data=types.Blob(
-                                mime_type="image/png", data=img_bytes
+                                mime_type=mime_type, data=img_bytes
                             )
                         )
                     )
@@ -823,6 +818,22 @@ class GeminiService:
         [新增] 核心的 AI 生成周期，包含上下文构建、工具调用循环和响应处理。
         此方法被 _generate_with_official_api 和 _generate_with_custom_endpoint 复用。
         """
+        # 自动 RAG 检索逻辑：如果调用方没传条目，且有用户消息，我们就自己去数据库搜！
+        if not world_book_entries and message:
+            try:
+                # 延迟导入，防止循环引用
+                from src.chat.features.world_book.database.world_book_db_manager import world_book_db_manager
+                
+                #拿着用户的消息去数据库里搜关键词
+                found_entries = await world_book_db_manager.search_entries_in_message(message)
+                
+                if found_entries:
+                    # 如果搜到了，就强制替换掉原本为空的 entries
+                    world_book_entries = found_entries
+                    titles = [e.get('title', '未知') for e in found_entries]
+                    log.info(f"📚 触发世界书/成员设定，已注入 Prompt: {titles}")
+            except Exception as e:
+                log.warning(f"世界书自动检索失败 (不影响正常对话): {e}")
         # --- 模型使用计数 ---
         # 使用 prompt_model_name (表面模型名) 进行计数，而不是 api_model_name (真实模型名)
         model_to_count = prompt_model_name or self.default_model_name
@@ -1494,6 +1505,12 @@ class GeminiService:
                 log.error(f"处理 GIF 图片时出错: {e}", exc_info=True)
                 return "呜哇，我的眼睛跟不上啦！有点看花眼了"
         # --- GIF 处理结束 ---
+
+        # --- 新增：检查并压缩图片 ---
+        try:
+            image_bytes, mime_type = sanitize_image(image_bytes)
+        except Exception as e:
+            log.error(f"压缩图片时出错: {e}")
 
         request_contents = [
             prompt,

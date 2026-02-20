@@ -22,6 +22,12 @@ from src.chat.services.event_service import event_service
 from src.chat.features.chat_settings.ui.ai_model_settings_modal import (
     AIModelSettingsModal,
 )
+from src.chat.features.personal_memory.services.personal_memory_service import (
+    personal_memory_service,
+)
+from src.chat.features.chat_settings.ui.memory_settings_modal import (
+    MemorySettingsModal,
+)
 
 
 class ChatSettingsView(View):
@@ -191,10 +197,18 @@ class ChatSettingsView(View):
         )
         self.add_item(
             Button(
+                label="记忆总结频率",
+                style=ButtonStyle.secondary,
+                custom_id="memory_settings",
+                row=0,
+            )
+        )
+        self.add_item(
+            Button(
                 label="今日 Token 统计",
                 style=ButtonStyle.secondary,
                 custom_id="show_token_usage",
-                row=0,
+                row=4,
             )
         )
 
@@ -228,6 +242,8 @@ class ChatSettingsView(View):
             await self.on_ai_model_settings(interaction)
         elif custom_id == "show_token_usage":
             await self.on_show_token_usage(interaction)
+        elif custom_id == "memory_settings":
+            await self.on_memory_settings(interaction)
 
         return True
 
@@ -406,6 +422,27 @@ class ChatSettingsView(View):
             title="更换全局AI模型",
             current_model=current_model,
             available_models=available_models,
+            on_submit_callback=modal_callback,
+        )
+        await interaction.response.send_modal(modal)
+
+    async def on_memory_settings(self, interaction: Interaction):
+        """打开记忆总结频率设置模态框。"""
+        current_threshold = personal_memory_service.get_summary_threshold()
+
+        async def modal_callback(
+            modal_interaction: Interaction, settings: Dict[str, Any]
+        ):
+            new_threshold = settings.get("threshold")
+            if new_threshold is not None:
+                personal_memory_service.set_summary_threshold(new_threshold)
+                await modal_interaction.response.send_message(
+                    f"✅ 已成功将记忆总结阈值更新为: **{new_threshold}** 条消息", ephemeral=True
+                )
+
+        modal = MemorySettingsModal(
+            title="设置记忆总结频率",
+            current_threshold=current_threshold,
             on_submit_callback=modal_callback,
         )
         await interaction.response.send_modal(modal)
