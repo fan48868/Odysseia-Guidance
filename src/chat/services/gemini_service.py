@@ -523,9 +523,9 @@ class GeminiService:
         如果选择了自定义模型，则优先尝试自定义端点；如果失败，则自动回退到官方 API。
         """
         # --- [新增] DeepSeek 专用路由 ---
-        if model_name == "deepseek-chat":
+        if model_name in ["deepseek-chat", "deepseek-reasoner"]:
             if self.deepseek_url and self.deepseek_key:
-                log.info("检测到 deepseek-chat 模型，切换至 DeepSeek 专用通道。")
+                log.info(f"检测到 {model_name} 模型，切换至 DeepSeek 专用通道。")
                 return await self._generate_with_deepseek(
                     user_id=user_id,
                     guild_id=guild_id,
@@ -887,16 +887,8 @@ class GeminiService:
             channel=channel,
         )
 
-        # 获取 System Prompt 以便使用 system role
-        system_prompt = prompt_service.get_prompt("SYSTEM_PROMPT", model_name=effective_model_name)
-        if not system_prompt:
-             log.warning("DeepSeek: 未能获取特定模型的 SYSTEM_PROMPT，回退到默认配置。")
-             system_prompt = prompt_service.get_prompt("SYSTEM_PROMPT", model_name="default")
-
         # 2. 转换为 OpenAI 格式的消息列表
         openai_messages = []
-        if system_prompt:
-             openai_messages.append({"role": "system", "content": system_prompt})
 
         for turn in final_conversation:
             role = turn.get("role")
@@ -911,14 +903,6 @@ class GeminiService:
                     content += part
                 elif isinstance(part, dict) and "text" in part:
                     content += part["text"]
-            
-            # 过滤掉已经在 system role 中添加的 System Prompt 及其确认消息
-            # 使用更宽松的比较，防止换行符差异
-            if system_prompt and role == "user" and content.strip().replace('\r\n', '\n') == system_prompt.strip().replace('\r\n', '\n'):
-                continue
-            # 过滤掉 prompt_service 中硬编码的确认消息
-            if role == "assistant" and content.strip() == "我在线啦，随时开聊！":
-                continue
 
             if content:
                 openai_messages.append({"role": role, "content": content})
@@ -944,7 +928,7 @@ class GeminiService:
                     api_url,
                     headers={"Authorization": f"Bearer {self.deepseek_key}", "Content-Type": "application/json"},
                     json={
-                        "model": "deepseek-chat",
+                        "model": effective_model_name,
                         "messages": openai_messages,
                         "stream": False,
                         "temperature": gen_config.get("temperature", 1.3),
