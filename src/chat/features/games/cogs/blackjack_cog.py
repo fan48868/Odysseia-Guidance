@@ -228,7 +228,7 @@ class BlackjackView(discord.ui.View):
                     bal = await coin_service.get_balance(self.user_id)
                     if bal < 100: return await it.response.send_message("余额不足 100 类脑币！", ephemeral=True)
                     
-                    await coin_service.remove_coins(self.user_id, 100, "删除嘲讽消息")
+                    await coin_service.remove_coins(self.user_id, 100, "Blackjack 删除嘲讽消息")
                     try:
                         await self.shame_message.delete()
                         self.shame_message = None
@@ -236,6 +236,7 @@ class BlackjackView(discord.ui.View):
                         await interaction.edit_original_response(view=self)
                         await it.response.send_message("黑历史已删除...", ephemeral=True)
                     except:
+                        await coin_service.add_coins(self.user_id, 100, "Blackjack 删除嘲讽消息失败退款")
                         await it.response.send_message("删除失败，可能已经被删除了。", ephemeral=True)
 
                 shame_btn = Button(label="😈我是杂鱼 (-100币)", style=discord.ButtonStyle.primary)

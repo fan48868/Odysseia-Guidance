@@ -4,7 +4,7 @@ import logging
 import os
 import asyncio
 from functools import partial
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 from datetime import datetime, timezone, timedelta
 from src.chat.config import chat_config
 
@@ -1483,13 +1483,115 @@ class ChatDatabaseManager:
         )
 
     async def get_blackjack_net_win_loss_today(self) -> int:
-        """获取今天的21点游戏净输赢。"""
-        today_date_str = get_beijing_today_str()
-        query = "SELECT net_win_loss FROM blackjack_daily_stats WHERE stat_date = ?"
-        result = await self._execute(
-            self._db_transaction, query, (today_date_str,), fetch="one"
+        """获取今天的21点游戏净输赢 (玩家视角)。"""
+        # 计算北京时间今天的起始时间对应的 UTC 时间
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day.astimezone(timezone.utc)
+
+        query = """
+            SELECT reason, amount 
+            FROM coin_transactions 
+            WHERE reason LIKE 'Blackjack%' 
+            AND timestamp >= ?
+        """
+
+        rows = await self._execute(
+            self._db_transaction, query, (start_of_day_utc,), fetch="all"
         )
-        return result["net_win_loss"] if result else 0
+
+        net = 0
+        for row in rows:
+            reason = row["reason"]
+            amount = abs(row["amount"])
+            
+            if "赢钱" in reason or "退款" in reason:
+                net += amount
+            elif "赌注" in reason or "加倍" in reason or "删除" in reason:
+                net -= amount
+                
+        return net
+
+    async def get_ghost_card_net_win_loss_today(self) -> int:
+        """获取今日抽鬼牌的净盈亏 (玩家视角)"""
+        # 计算北京时间今天的起始时间对应的 UTC 时间
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day.astimezone(timezone.utc)
+
+        query = """
+            SELECT reason, amount 
+            FROM coin_transactions 
+            WHERE reason LIKE '鬼牌%' 
+            AND timestamp >= ?
+        """
+
+        rows = await self._execute(
+            self._db_transaction, 
+            query, 
+            (start_of_day_utc.strftime("%Y-%m-%d %H:%M:%S"),), 
+            fetch="all"
+        )
+
+        net = 0
+        for row in rows:
+            reason = row["reason"]
+            amount = abs(row["amount"])
+            
+            if "获胜" in reason or "退款" in reason:
+                net += amount
+            elif "赌注" in reason or "删除" in reason:
+                net -= amount
+                
+        return net
+
+    async def get_daily_unluckiest_gambler(self) -> Optional[Tuple[int, int]]:
+        """获取今日最倒霉赌徒 (输钱最多)。返回 (user_id, net_loss_amount)"""
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day.astimezone(timezone.utc)
+
+        query = """
+            SELECT user_id, reason, amount 
+            FROM coin_transactions 
+            WHERE (reason LIKE '鬼牌%' OR reason LIKE 'Blackjack%')
+            AND timestamp >= ?
+        """
+        
+        rows = await self._execute(
+            self._db_transaction, 
+            query, 
+            (start_of_day_utc.strftime("%Y-%m-%d %H:%M:%S"),), 
+            fetch="all"
+        )
+
+        user_net = {}
+        for row in rows:
+            uid = row["user_id"]
+            reason = row["reason"]
+            amount = abs(row["amount"])
+            
+            if uid not in user_net:
+                user_net[uid] = 0
+            
+            if "获胜" in reason or "退款" in reason or "赢钱" in reason:
+                user_net[uid] += amount
+            elif "赌注" in reason or "删除" in reason or "加倍" in reason:
+                user_net[uid] -= amount
+        
+        if not user_net:
+            return None
+            
+        # 找最小值 (负得最多)
+        unluckiest_user = min(user_net.items(), key=lambda x: x[1])
+        
+        if unluckiest_user[1] < 0:
+            return (unluckiest_user[0], abs(unluckiest_user[1]))
+            
+        return None
 
     async def increment_confession_count(self) -> None:
         """增加今天的忏悔次数。"""
@@ -1510,6 +1612,88 @@ class ChatDatabaseManager:
             self._db_transaction, query, (today_date_str,), fetch="one"
         )
         return result["confession_count"] if result else 0
+
+    async def get_ghost_card_net_win_loss_today(self) -> int:
+        """获取今日抽鬼牌的净盈亏 (玩家视角)"""
+        # 计算北京时间今天的起始时间对应的 UTC 时间
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day.astimezone(timezone.utc)
+
+        query = """
+            SELECT reason, amount 
+            FROM coin_transactions 
+            WHERE reason LIKE '鬼牌%' 
+            AND timestamp >= ?
+        """
+
+        rows = await self._execute(
+            self._db_transaction, 
+            query, 
+            (start_of_day_utc,), 
+            fetch="all"
+        )
+
+        net = 0
+        for row in rows:
+            reason = row["reason"]
+            amount = abs(row["amount"])
+            
+            if "获胜" in reason or "退款" in reason:
+                net += amount
+            elif "赌注" in reason or "删除" in reason:
+                net -= amount
+                
+        return net
+
+    async def get_daily_unluckiest_gambler(self) -> Optional[Tuple[int, int]]:
+        """获取今日最倒霉赌徒 (输钱最多)。返回 (user_id, net_loss_amount)"""
+        beijing_tz = timezone(timedelta(hours=8))
+        now = datetime.now(beijing_tz)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day.astimezone(timezone.utc)
+
+        query = """
+            SELECT user_id, reason, amount 
+            FROM coin_transactions 
+            WHERE (reason LIKE '鬼牌%' OR reason LIKE 'Blackjack%')
+            AND timestamp >= ?
+        """
+        
+        rows = await self._execute(
+            self._db_transaction, 
+            query, 
+            (start_of_day_utc,), 
+            fetch="all"
+        )
+
+        user_net = {}
+        for row in rows:
+            uid = row["user_id"]
+            reason = row["reason"]
+            amount = abs(row["amount"])
+            
+            if uid not in user_net:
+                user_net[uid] = 0
+            
+            # 统一判定逻辑
+            if any(k in reason for k in ["获胜", "退款", "赢钱"]):
+                user_net[uid] += amount
+            elif any(k in reason for k in ["赌注", "删除", "加倍"]):
+                user_net[uid] -= amount
+        
+        if not user_net:
+            return None
+            
+        # 找最小值 (负得最多)
+        unluckiest_user = min(user_net.items(), key=lambda x: x[1])
+        
+        # 只有当净值为负时才算倒霉
+        if unluckiest_user[1] < 0:
+            return (unluckiest_user[0], abs(unluckiest_user[1]))
+            
+        return None
 
     async def increment_feeding_count(self) -> None:
         """增加今天的投喂次数。"""

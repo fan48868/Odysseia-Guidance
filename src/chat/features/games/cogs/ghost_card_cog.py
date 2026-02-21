@@ -228,7 +228,7 @@ class GhostBettingView(View):
         if await coin_service.get_balance(self.user_id) < amount:
             return await it.response.send_message("余额不足！", ephemeral=True)
         
-        await coin_service.remove_coins(self.user_id, amount, "鬼牌赌注")
+        await coin_service.remove_coins(self.user_id, amount, "鬼牌 赌注")
         
         game = GhostGameSession(self.user_id, amount)
         controller = GameControlView(self.cog, game, self.disp_msg, mode=self.mode)
@@ -321,13 +321,13 @@ class GhostReplayView(View):
             bal = await coin_service.get_balance(self.user_id)
             if bal < 100: return await it.response.send_message("余额不足 100 类脑币，无法删除黑历史！", ephemeral=True)
             
-            await coin_service.remove_coins(self.user_id, 100, "删除嘲讽消息")
+            await coin_service.remove_coins(self.user_id, 100, "鬼牌 删除嘲讽消息")
             try:
                 await self.shame_msg.delete()
             except discord.NotFound:
                 pass # 已经被删除了，算成功
             except Exception:
-                await coin_service.add_coins(self.user_id, 100, "删除嘲讽消息失败退款")
+                await coin_service.add_coins(self.user_id, 100, "鬼牌 删除嘲讽消息失败退款")
                 return await it.response.send_message("删除失败，可能已经被删除了。", ephemeral=True)
 
             self.shame_msg = None
@@ -524,7 +524,7 @@ class GameControlView(View):
         if winner == "player":
             win = int(self.game.bet * 2)
             key = "lose" # AI lose
-            await coin_service.add_coins(self.game.user_id, win, "鬼牌获胜")
+            await coin_service.add_coins(self.game.user_id, win, "鬼牌 获胜")
             res = f"太好啦！**你赢了！** 类脑娘抽到了鬼牌呢～ (获得 {win} 类脑币)"
             shame_msg = None
         else:
@@ -652,7 +652,7 @@ class GhostCardCog(commands.Cog):
         # 玩家胜利 (被抽光)
         if not game.player_hand:
             win = int(game.bet * 2)
-            await coin_service.add_coins(game.user_id, win, "鬼牌获胜")
+            await coin_service.add_coins(game.user_id, win, "鬼牌 获胜")
             res = f"🎉 胜利！牌被抽光了！获得 {win} 币"
             key_lose = "lose"
             dlg = random.choice(DIALOGUES[key_lose])
