@@ -206,9 +206,13 @@ def _api_key_handler(func: Callable) -> Callable:
 
             except NoAvailableKeyError:
                 log.error("所有官方 API 密钥均不可用。")
+                if func.__name__ == "generate_embedding":
+                    return None
                 return "啊啊啊服务器要爆炸啦！现在有点忙不过来，你过一会儿再来找我玩吧！<生气>"
             except Exception as outer_e:
                 log.error(f"严重未知错误: {outer_e}", exc_info=True)
+                if func.__name__ == "generate_embedding":
+                    return None
                 return "系统发生严重错误。"
 
     return wrapper

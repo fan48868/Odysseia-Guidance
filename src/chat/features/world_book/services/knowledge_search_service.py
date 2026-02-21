@@ -131,8 +131,8 @@ class KnowledgeSearchService:
             query_embedding = await gemini_service.generate_embedding(
                 text=query, task_type="retrieval_query"
             )
-            if not query_embedding:
-                raise ValueError("Embedding 生成失败，返回为空。")
+            if not query_embedding or not isinstance(query_embedding, list):
+                raise ValueError(f"Embedding 生成失败，返回为空或类型错误: {type(query_embedding)}")
         except Exception as e:
             log.error(f"为查询 '{query}' 生成 embedding 时出错: {e}", exc_info=True)
             return []
