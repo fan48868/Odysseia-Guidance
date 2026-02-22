@@ -20,10 +20,12 @@ class KnowledgeSearchService:
         log.info("KnowledgeSearchService 已初始化")
         # 在未来可以从配置中加载参数
         self.config = {
-            "TOP_K_VECTOR": 10,
-            "TOP_K_FTS": 10,
+            "TOP_K_VECTOR": 30,  # 增加召回量，防止指令词(如"开始xx模式")导致核心词排名下降
+            "TOP_K_FTS": 30,     # 增加召回量，提高关键字匹配的容错率
             "RRF_K": 60,
-            "HYBRID_SEARCH_FINAL_K": 5,
+            "HYBRID_SEARCH_FINAL_K": 5, # 返回更多结果给上层，避免过早截断
+            "VECTOR_DISTANCE_THRESHOLD": 0.5, # 向量搜索距离阈值，过滤不相关结果
+            "KEYWORD_WEIGHT": 3.0, # 关键字搜索权重，提高精确匹配的重要性
         }
 
     def _clean_fts_query(self, query: str) -> str:
@@ -50,20 +52,24 @@ class KnowledgeSearchService:
                 -- 社区成员向量搜索
                 (SELECT
                     'community' as source_table,
-                    profile_id as document_id,
+                    id as chunk_id,
+                    profile_id as parent_id,
                     chunk_text,
-                    RANK() OVER (ORDER BY embedding <=> :query_vector) as rank
+                    ROW_NUMBER() OVER (ORDER BY embedding <=> :query_vector) as rank
                 FROM community.member_chunks
+                WHERE (embedding <=> :query_vector) < :max_distance
                 ORDER BY embedding <=> :query_vector
                 LIMIT :top_k_vector)
                 UNION ALL
                 -- 通用知识向量搜索
                 (SELECT
                     'general_knowledge' as source_table,
-                    document_id,
+                    id as chunk_id,
+                    document_id as parent_id,
                     chunk_text,
-                    RANK() OVER (ORDER BY embedding <=> :query_vector) as rank
+                    ROW_NUMBER() OVER (ORDER BY embedding <=> :query_vector) as rank
                 FROM general_knowledge.knowledge_chunks
+                WHERE (embedding <=> :query_vector) < :max_distance
                 ORDER BY embedding <=> :query_vector
                 LIMIT :top_k_vector)
             ),
@@ -71,9 +77,10 @@ class KnowledgeSearchService:
                 -- 社区成员 BM25 搜索 (使用 paradedb.score)
                 (SELECT
                     'community' as source_table,
-                    id as document_id, -- 统一ID字段名
+                    id as chunk_id,
+                    profile_id as parent_id,
                     chunk_text,
-                    RANK() OVER (ORDER BY paradedb.score(id) DESC) as rank
+                    ROW_NUMBER() OVER (ORDER BY paradedb.score(id) DESC) as rank
                 FROM community.member_chunks
                 WHERE chunk_text @@@ :query_text
                 LIMIT :top_k_fts)
@@ -81,9 +88,10 @@ class KnowledgeSearchService:
                 -- 通用知识 BM25 搜索 (使用 paradedb.score)
                 (SELECT
                     'general_knowledge' as source_table,
-                    id as document_id, -- 统一ID字段名
+                    id as chunk_id,
+                    document_id as parent_id,
                     chunk_text,
-                    RANK() OVER (ORDER BY paradedb.score(id) DESC) as rank
+                    ROW_NUMBER() OVER (ORDER BY paradedb.score(id) DESC) as rank
                 FROM general_knowledge.knowledge_chunks
                 WHERE chunk_text @@@ :query_text
                 LIMIT :top_k_fts)
@@ -91,12 +99,13 @@ class KnowledgeSearchService:
             -- 使用 RRF (Reciprocal Rank Fusion) 融合排名
             fused_ranks AS (
                 SELECT
-                    COALESCE(s.document_id, k.document_id) as document_id,
+                    COALESCE(s.chunk_id, k.chunk_id) as chunk_id,
+                    COALESCE(s.parent_id, k.parent_id) as document_id,
                     COALESCE(s.source_table, k.source_table) as source_table,
                     COALESCE(s.chunk_text, k.chunk_text) as chunk_text,
-                    (COALESCE(1.0 / (:rrf_k + s.rank), 0.0) + COALESCE(1.0 / (:rrf_k + k.rank), 0.0)) as rrf_score
+                    (COALESCE(1.0 / (:rrf_k + s.rank), 0.0) + COALESCE(:keyword_weight / (:rrf_k + k.rank), 0.0)) as rrf_score
                 FROM semantic_search s
-                FULL OUTER JOIN keyword_search k ON s.document_id = k.document_id AND s.chunk_text = k.chunk_text
+                FULL OUTER JOIN keyword_search k ON s.chunk_id = k.chunk_id AND s.source_table = k.source_table
             )
             SELECT *
             FROM fused_ranks
@@ -113,6 +122,8 @@ class KnowledgeSearchService:
                 "top_k_fts": self.config["TOP_K_FTS"],
                 "rrf_k": self.config["RRF_K"],
                 "final_k": self.config["HYBRID_SEARCH_FINAL_K"],
+                "max_distance": self.config["VECTOR_DISTANCE_THRESHOLD"],
+                "keyword_weight": self.config["KEYWORD_WEIGHT"],
             },
         )
         # SQLAlchemy 2.x 的 Row 对象需要通过 ._mapping 转换为字典

@@ -850,31 +850,137 @@ class GeminiService:
         user_id_for_settings: Optional[str] = None,
     ) -> str:
         """
-        [新增] 专门用于处理 DeepSeek API 的方法。
-        直接使用 httpx 发送 OpenAI 格式的请求。
+        [重构] 包含完整工具调用 (Tool Calling) 循环的 DeepSeek 专用通道。
+        自动完成 Gemini 协议到 OpenAI 协议的双向转换。
         """
-        # --- 模型使用计数 ---
         effective_model_name = model_name or "deepseek-chat"
         await chat_settings_service.increment_model_usage(effective_model_name)
 
-        # --- [新增] 自动 RAG 检索逻辑 (保持与 _execute_generation_cycle 一致) ---
+        # --- 1. 自动 RAG 检索逻辑 ---
         if not world_book_entries and message:
             try:
-                # 延迟导入，防止循环引用
                 from src.chat.features.world_book.database.world_book_db_manager import world_book_db_manager
-                
-                # 拿着用户的消息去数据库里搜关键词
                 found_entries = await world_book_db_manager.search_entries_in_message(message)
-                
                 if found_entries:
-                    # 如果搜到了，就强制替换掉原本为空的 entries
                     world_book_entries = found_entries
                     titles = [e.get('title', '未知') for e in found_entries]
                     log.info(f"📚 [DeepSeek] 触发世界书/成员设定，已注入 Prompt: {titles}")
             except Exception as e:
                 log.warning(f"[DeepSeek] 世界书自动检索失败: {e}")
 
-        # 1. 构建 Prompt (复用现有逻辑)
+        # --- 2. 获取并转换工具 (Python函数对象 -> OpenAI 格式) ---
+        dynamic_tools = await self.tool_service.get_dynamic_tools_for_context(
+            user_id_for_settings=user_id_for_settings
+        )
+        openai_tools = []
+
+        # Python 类型注解 -> JSON Schema 类型映射
+        _PY_TYPE_MAP = {
+            "str": "string", "int": "integer", "float": "number",
+            "bool": "boolean", "list": "array", "dict": "object",
+            "List": "array", "Dict": "object", "Any": "string",
+        }
+        # 由系统注入、不暴露给模型的参数
+        _INTERNAL_PARAMS = {
+            "bot", "guild", "channel", "guild_id", "thread_id",
+            "log_detailed", "kwargs",
+        }
+
+        if dynamic_tools:
+            import inspect as _inspect
+            try:
+                from pydantic import BaseModel as _BaseModel
+            except ImportError:
+                _BaseModel = None
+
+            def _pydantic_to_schema(model_cls):
+                """将 Pydantic BaseModel 展开为 JSON Schema object。"""
+                props = {}
+                reqs = []
+                for field_name, field_info in model_cls.model_fields.items():
+                    ann = field_info.annotation
+                    ann_str = str(ann) if ann is not None else "string"
+                    base = ann_str.replace("typing.", "").split("[")[0].strip()
+                    f_type = _PY_TYPE_MAP.get(base, "string")
+                    desc = field_info.description or ""
+                    prop = {"type": f_type}
+                    if desc:
+                        prop["description"] = desc
+                    if field_info.default is not None:
+                        prop["default"] = field_info.default
+                    props[field_name] = prop
+                    # 没有默认值的字段为 required
+                    if field_info.is_required():
+                        reqs.append(field_name)
+                schema = {"type": "object", "properties": props}
+                if reqs:
+                    schema["required"] = reqs
+                return schema
+
+            for tool in dynamic_tools:
+                try:
+                    func_name = tool.__name__
+                    func_desc = (tool.__doc__ or "").strip()
+
+                    sig = _inspect.signature(tool)
+                    properties = {}
+                    required = []
+
+                    for param_name, param in sig.parameters.items():
+                        if param_name in _INTERNAL_PARAMS:
+                            continue
+                        if param.kind in (_inspect.Parameter.VAR_KEYWORD,
+                                          _inspect.Parameter.VAR_POSITIONAL):
+                            continue
+
+                        # 检查是否是 Pydantic BaseModel 子类 → 作为嵌套 object 保留键名
+                        ann = param.annotation
+                        if (_BaseModel is not None
+                                and ann != _inspect.Parameter.empty
+                                and isinstance(ann, type)
+                                and issubclass(ann, _BaseModel)):
+                            # 保留原参数名（如 params），schema 展开为 object
+                            # 这样 DeepSeek 会传 {"params": {"limit": 200}}，与 Gemini 一致
+                            sub_schema = _pydantic_to_schema(ann)
+                            properties[param_name] = sub_schema
+                            if param.default is _inspect.Parameter.empty:
+                                required.append(param_name)
+                            continue
+
+                        param_type = "string"
+                        if ann != _inspect.Parameter.empty:
+                            ann_str = str(ann) if not isinstance(ann, str) else ann
+                            base = ann_str.replace("typing.", "").split("[")[0].strip()
+                            param_type = _PY_TYPE_MAP.get(base, "string")
+
+                        properties[param_name] = {"type": param_type}
+
+                        if param.default is _inspect.Parameter.empty:
+                            required.append(param_name)
+
+                    final_params = {"type": "object", "properties": properties}
+                    if required:
+                        final_params["required"] = required
+
+                    openai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": func_name,
+                            "description": func_desc,
+                            "parameters": final_params,
+                        }
+                    })
+                    log.debug(f"[DeepSeek] 成功转换工具: {func_name}")
+
+                except Exception as e:
+                    log.error(f"[DeepSeek 工具转换失败] 跳过工具 '{getattr(tool, '__name__', tool)}'，错误: {e}", exc_info=True)
+
+            if openai_tools:
+                log.info(f"[DeepSeek] 成功转换 {len(openai_tools)} 个工具发往 API。")
+            else:
+                log.warning("[DeepSeek] 获取到了工具，但转换结果为空！")
+
+        # --- 3. 构建 Prompt 并转换为 OpenAI 消息格式 ---
         final_conversation = await prompt_service.build_chat_prompt(
             user_name=user_name,
             message=message,
@@ -891,47 +997,63 @@ class GeminiService:
             channel=channel,
         )
 
-        # 2. 转换为 OpenAI 格式的消息列表
         openai_messages = []
-
+        is_first_user = True  # 第一条 user 消息是 system prompt，转为 system role
         for turn in final_conversation:
-            role = turn.get("role")
-            # 映射角色：model -> assistant
-            if role == "model":
-                role = "assistant"
-            
-            content = ""
-            parts = turn.get("parts", [])
-            for part in parts:
-                if isinstance(part, str):
-                    content += part
-                elif isinstance(part, dict) and "text" in part:
-                    content += part["text"]
-
-            if content:
-                openai_messages.append({"role": role, "content": content})
-
-        # --- [调试日志] 打印发送给 DeepSeek 的完整消息列表 ---
-        if app_config.DEBUG_CONFIG.get("LOG_AI_FULL_CONTEXT", False):
-            log.info(f"--- [DeepSeek] 发送的完整上下文 ---\n{json.dumps(openai_messages, ensure_ascii=False, indent=2)}")
-
-        # 3. 发送请求
-        try:
-            # 处理 URL，确保指向 chat/completions
-            api_url = self.deepseek_url.rstrip("/")
-            if not api_url.endswith("/chat/completions"):
-                 api_url += "/chat/completions"
-            
-            # 获取生成配置
-            gen_config = app_config.MODEL_GENERATION_CONFIG.get(
-                effective_model_name, app_config.MODEL_GENERATION_CONFIG["default"]
+            gemini_role = turn.get("role")
+            content = "".join(
+                [part["text"] if isinstance(part, dict) and "text" in part else str(part)
+                 for part in turn.get("parts", [])
+                 if not (hasattr(part, "thought") and getattr(part, "thought", False))]
             )
+            if not content:
+                continue
 
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    api_url,
-                    headers={"Authorization": f"Bearer {self.deepseek_key}", "Content-Type": "application/json"},
-                    json={
+            if gemini_role == "model":
+                openai_messages.append({"role": "assistant", "content": content})
+            else:
+                if is_first_user:
+                    # 第一条 user 消息（system prompt）转为 system role
+                    openai_messages.append({"role": "system", "content": content})
+                    is_first_user = False
+                else:
+                    openai_messages.append({"role": "user", "content": content})
+
+        # --- 4. 输出完整上下文日志（与 Gemini 路径的 LOG_AI_FULL_CONTEXT 对齐）---
+        log_detailed = app_config.DEBUG_CONFIG.get("LOG_DETAILED_GEMINI_PROCESS", False)
+        if log_detailed:
+            log.info(f"--- [DeepSeek] 完整发送上下文 (用户 {user_id}) ---")
+            log.info(
+                json.dumps(
+                    openai_messages,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+            )
+            if openai_tools:
+                log.info("--- [DeepSeek] 工具列表 ---")
+                log.info(
+                    json.dumps(openai_tools, ensure_ascii=False, indent=2, default=str)
+                )
+            log.info("------------------------------------")
+
+        # --- 5. 核心：带工具调用的请求循环 ---
+        api_url = self.deepseek_url.rstrip("/")
+        if not api_url.endswith("/chat/completions"):
+             api_url += "/chat/completions"
+             
+        gen_config = app_config.MODEL_GENERATION_CONFIG.get(
+            effective_model_name, app_config.MODEL_GENERATION_CONFIG["default"]
+        )
+
+        max_calls = 5
+        called_tool_names = []
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as http_client:
+                for i in range(max_calls):
+                    payload = {
                         "model": effective_model_name,
                         "messages": openai_messages,
                         "stream": False,
@@ -939,13 +1061,86 @@ class GeminiService:
                         "top_p": gen_config.get("top_p", 0.95),
                         "max_tokens": gen_config.get("max_output_tokens", 8192),
                     }
-                )
-                response.raise_for_status()
-                result = response.json()
-                raw_content = result["choices"][0]["message"]["content"]
-                
-                # 4. 后处理
-                return await self._post_process_response(raw_content, user_id, guild_id)
+                    if openai_tools:
+                        payload["tools"] = openai_tools
+
+                    response = await http_client.post(
+                        api_url,
+                        headers={"Authorization": f"Bearer {self.deepseek_key}", "Content-Type": "application/json"},
+                        json=payload
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    response_message = result["choices"][0]["message"]
+                    openai_messages.append(response_message)  # 把模型的回复或工具调用指令加入上下文
+
+                    tool_calls = response_message.get("tool_calls")
+
+                    # 与 Gemini 路径保持一致：无工具调用则直接生成文本
+                    if not tool_calls:
+                        if log_detailed:
+                            log.info("--- [DeepSeek] 模型决策：直接生成文本回复 (未调用工具) ---")
+                            log.info("模型返回了最终文本响应，工具调用流程结束。")
+                        raw_content = response_message.get("content", "")
+                        self.last_called_tools = called_tool_names
+                        log.info("--- [DeepSeek] 文本生成完成 ---")
+                        return await self._post_process_response(raw_content, user_id, guild_id)
+
+                    # 有工具调用
+                    if log_detailed:
+                        log.info(f"--- [DeepSeek] 模型决策：建议进行工具调用 (第 {i + 1}/{max_calls} 次) ---")
+                        for call in tool_calls:
+                            try:
+                                args_preview = json.loads(call["function"]["arguments"])
+                            except Exception:
+                                args_preview = {}
+                            log.info(f"  - 工具名称: {call['function']['name']}")
+                            args_str_preview = json.dumps(args_preview, ensure_ascii=False, indent=2)
+                            log.info("  - 调用参数:\n" + args_str_preview)
+                        log.info("------------------------------------")
+
+                    for call in tool_calls:
+                        tool_name = call["function"]["name"]
+                        called_tool_names.append(tool_name)
+
+                        try:
+                            args = json.loads(call["function"]["arguments"])
+                        except Exception:
+                            args = {}
+
+                        log.info(f"  - 准备执行工具: {tool_name}, 参数: {args}")
+
+                        # 【关键桥接】伪造 Gemini 的 FunctionCall 对象，交给 ToolService 执行
+                        mock_gemini_call = types.FunctionCall(name=tool_name, args=args)
+
+                        tool_res = await self.tool_service.execute_tool_call(
+                            tool_call=mock_gemini_call,
+                            channel=channel,
+                            user_id=user_id,
+                            log_detailed=log_detailed,
+                            user_id_for_settings=user_id_for_settings,
+                        )
+
+                        # 解析工具执行的结果并转换为 OpenAI 格式
+                        if isinstance(tool_res, types.Part) and tool_res.function_response:
+                            content_str = json.dumps(tool_res.function_response.response, ensure_ascii=False)
+                        else:
+                            content_str = str(tool_res)
+
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "name": tool_name,
+                            "content": content_str,
+                        })
+
+                    # 工具执行完毕，继续下一轮让 DeepSeek 总结结果
+                    continue
+
+                # 如果超出了最大调用次数
+                self.last_called_tools = called_tool_names
+                return "哎呀，我好像陷入了一个复杂的思考循环里，换个话题聊聊吧！"
 
         except Exception as e:
             log.error(f"DeepSeek API 调用失败: {e}", exc_info=True)
