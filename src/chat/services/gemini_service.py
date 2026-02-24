@@ -888,12 +888,6 @@ class GeminiService:
         )
         openai_tools = []
 
-        # Python 类型注解 -> JSON Schema 类型映射
-        _PY_TYPE_MAP = {
-            "str": "string", "int": "integer", "float": "number",
-            "bool": "boolean", "list": "array", "dict": "object",
-            "List": "array", "Dict": "object", "Any": "string",
-        }
         # 由系统注入、不暴露给模型的参数
         _INTERNAL_PARAMS = {
             "bot", "guild", "channel", "guild_id", "thread_id",
@@ -907,28 +901,62 @@ class GeminiService:
             except ImportError:
                 _BaseModel = None
 
+            def _map_py_type_to_schema(ann):
+                """将 Python 类型注解映射为 DeepSeek Strict Mode 兼容的 JSON Schema"""
+                if ann is _inspect.Parameter.empty:
+                    return {"type": "string"}
+                
+                ann_str = str(ann)
+                # 检测 Optional/Union[..., NoneType]
+                is_nullable = "NoneType" in ann_str or "Optional" in ann_str
+                
+                t = "string"
+                if "List" in ann_str or "list" in ann_str:
+                    t = "array"
+                elif "Dict" in ann_str or "dict" in ann_str:
+                    t = "object"
+                elif "int" in ann_str:
+                    t = "integer"
+                elif "float" in ann_str:
+                    t = "number"
+                elif "bool" in ann_str:
+                    t = "boolean"
+                
+                schema = {}
+                if is_nullable:
+                    schema["type"] = [t, "null"]
+                else:
+                    schema["type"] = t
+                    
+                if t == "array":
+                    # DeepSeek Strict Mode 要求 array 必须有 items
+                    # 默认为 string，覆盖 List[str] 等常见情况
+                    schema["items"] = {"type": "string"}
+                    
+                return schema
+
             def _pydantic_to_schema(model_cls):
                 """将 Pydantic BaseModel 展开为 JSON Schema object。"""
                 props = {}
                 reqs = []
                 for field_name, field_info in model_cls.model_fields.items():
-                    ann = field_info.annotation
-                    ann_str = str(ann) if ann is not None else "string"
-                    base = ann_str.replace("typing.", "").split("[")[0].strip()
-                    f_type = _PY_TYPE_MAP.get(base, "string")
-                    desc = field_info.description or ""
-                    prop = {"type": f_type}
-                    if desc:
-                        prop["description"] = desc
+                    schema = _map_py_type_to_schema(field_info.annotation)
+                    
+                    if field_info.description:
+                        schema["description"] = field_info.description
                     if field_info.default is not None:
-                        prop["default"] = field_info.default
-                    props[field_name] = prop
-                    # 没有默认值的字段为 required
-                    if field_info.is_required():
-                        reqs.append(field_name)
-                schema = {"type": "object", "properties": props}
-                if reqs:
-                    schema["required"] = reqs
+                        schema["default"] = field_info.default
+                        
+                    props[field_name] = schema
+                    # DeepSeek Strict Mode: 所有字段必须 required
+                    reqs.append(field_name)
+
+                schema = {
+                    "type": "object",
+                    "properties": props,
+                    "required": reqs,
+                    "additionalProperties": False
+                }
                 return schema
 
             for tool in dynamic_tools:
@@ -957,24 +985,23 @@ class GeminiService:
                             # 这样 DeepSeek 会传 {"params": {"limit": 200}}，与 Gemini 一致
                             sub_schema = _pydantic_to_schema(ann)
                             properties[param_name] = sub_schema
-                            if param.default is _inspect.Parameter.empty:
-                                required.append(param_name)
+                            # DeepSeek Strict Mode: top level params also required
+                            required.append(param_name)
                             continue
 
-                        param_type = "string"
-                        if ann != _inspect.Parameter.empty:
-                            ann_str = str(ann) if not isinstance(ann, str) else ann
-                            base = ann_str.replace("typing.", "").split("[")[0].strip()
-                            param_type = _PY_TYPE_MAP.get(base, "string")
+                        # 普通参数处理
+                        schema = _map_py_type_to_schema(param.annotation)
+                        properties[param_name] = schema
 
-                        properties[param_name] = {"type": param_type}
+                        # DeepSeek Strict Mode: 所有参数必须 required
+                        required.append(param_name)
 
-                        if param.default is _inspect.Parameter.empty:
-                            required.append(param_name)
-
-                    final_params = {"type": "object", "properties": properties}
-                    if required:
-                        final_params["required"] = required
+                    final_params = {
+                        "type": "object",
+                        "properties": properties,
+                        "required": required,
+                        "additionalProperties": False
+                    }
 
                     openai_tools.append({
                         "type": "function",
@@ -982,6 +1009,7 @@ class GeminiService:
                             "name": func_name,
                             "description": func_desc,
                             "parameters": final_params,
+                            "strict": True
                         }
                     })
                     log.debug(f"[DeepSeek] 成功转换工具: {func_name}")
@@ -1063,6 +1091,7 @@ class GeminiService:
 
         max_calls = 5
         called_tool_names = []
+        bad_format_retries = 0
 
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
@@ -1087,16 +1116,45 @@ class GeminiService:
                     result = response.json()
 
                     response_message = result["choices"][0]["message"]
-                    openai_messages.append(response_message)  # 把模型的回复或工具调用指令加入上下文
+
+                    # --- [DeepSeek] 提取并记录思考过程 ---
+                    # deepseek-reasoner 模型会将思维链放在 reasoning_content 字段中
+                    # 该字段与 content 分离，因此不会直接发送给用户
+                    reasoning_content = response_message.get("reasoning_content")
+                    if reasoning_content:
+                        log.info(f"--- [DeepSeek] 思考过程 ---\n{reasoning_content}\n-----------------------------")
+
+                    # 将回复加入上下文
+                    # 注意：为了避免下一次请求报错，我们需要移除 reasoning_content 字段，只保留标准 OpenAI 格式字段
+                    history_message = response_message.copy()
+                    if "reasoning_content" in history_message:
+                        del history_message["reasoning_content"]
+                    openai_messages.append(history_message)
 
                     tool_calls = response_message.get("tool_calls")
 
                     # 与 Gemini 路径保持一致：无工具调用则直接生成文本
                     if not tool_calls:
+                        # --- 违禁词检测 ---
+                        raw_content = response_message.get("content", "")
+                        if raw_content and re.search(r"不过话说回来|话说回来|另外|话又说回来|不过话又说回来", raw_content):
+                            if bad_format_retries < 3:
+                                log.warning(
+                                    f"[DeepSeek] 检测到违禁词 '不过话说回来' (尝试 {bad_format_retries + 1}/3)。正在重试..."
+                                )
+                                openai_messages.append({
+                                    "role": "user",
+                                    "content": "[系统提示] 检测到你使用了“不过话说回来|话说回来|另外|话又说回来”。这是被禁止的。请重新生成回复，去掉这个短语，保持语气自然。"
+                                })
+                                bad_format_retries += 1
+                                continue
+                            else:
+                                return "抱歉，我的说话格式一直达不到要求，我是杂鱼"
+                        # ----------------
                         if log_detailed:
                             log.info("--- [DeepSeek] 模型决策：直接生成文本回复 (未调用工具) ---")
                             log.info("模型返回了最终文本响应，工具调用流程结束。")
-                        raw_content = response_message.get("content", "")
+                        raw_content = response_message.get("content") or ""
                         self.last_called_tools = called_tool_names
                         log.info("--- [DeepSeek] 文本生成完成 ---")
                         return await self._post_process_response(raw_content, user_id, guild_id)
