@@ -1138,7 +1138,18 @@ class GeminiService:
 
                         # 解析工具执行的结果并转换为 OpenAI 格式
                         if isinstance(tool_res, types.Part) and tool_res.function_response:
-                            content_str = json.dumps(tool_res.function_response.response, ensure_ascii=False)
+                            raw_response = tool_res.function_response.response
+                            # DeepSeek 是纯文本 API，无法处理图片数据
+                            # 深拷贝后剔除所有 base64 图片字段，避免请求体过大触发 400
+                            import copy as _copy
+                            clean_response = _copy.deepcopy(raw_response)
+                            result_data = clean_response.get("result", {})
+                            if isinstance(result_data, dict):
+                                profile = result_data.get("profile", {})
+                                if isinstance(profile, dict) and "avatar_image_base64" in profile:
+                                    del profile["avatar_image_base64"]
+                                    profile["avatar_note"] = "（头像图片数据已省略，仅文字通道可用）"
+                            content_str = json.dumps(clean_response, ensure_ascii=False)
                         else:
                             content_str = str(tool_res)
 
