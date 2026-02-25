@@ -866,6 +866,7 @@ class GeminiService:
         """
         [重构] 包含完整工具调用 (Tool Calling) 循环的 DeepSeek 专用通道。
         自动完成 Gemini 协议到 OpenAI 协议的双向转换。
+        已根据最新官方文档更新：移除 Strict Mode，支持 reasoning_content 回传。
         """
         effective_model_name = model_name or "deepseek-chat"
         await chat_settings_service.increment_model_usage(effective_model_name)
@@ -918,14 +919,27 @@ class GeminiService:
                     f_type = _PY_TYPE_MAP.get(base, "string")
                     desc = field_info.description or ""
                     prop = {"type": f_type}
-                    if desc:
-                        prop["description"] = desc
+                    
+                    # Pydantic 模型内部的 Array 类型也需要 items
+                    if f_type == "array":
+                        item_type = "string"
+                        if "[" in ann_str and "]" in ann_str:
+                            inner_type = ann_str.split("[")[1].split("]")[0].strip()
+                            inner_base = inner_type.replace("typing.", "")
+                            item_type = _PY_TYPE_MAP.get(inner_base, "string")
+                        prop["items"] = {"type": item_type}
+
                     if field_info.default is not None:
                         prop["default"] = field_info.default
+                            
+                    if desc:
+                        prop["description"] = desc
+                        
                     props[field_name] = prop
-                    # 没有默认值的字段为 required
+                    
                     if field_info.is_required():
                         reqs.append(field_name)
+
                 schema = {"type": "object", "properties": props}
                 if reqs:
                     schema["required"] = reqs
@@ -949,25 +963,42 @@ class GeminiService:
 
                         # 检查是否是 Pydantic BaseModel 子类 → 作为嵌套 object 保留键名
                         ann = param.annotation
+                        ann_str = str(ann) if not isinstance(ann, str) else ann
+                        
                         if (_BaseModel is not None
                                 and ann != _inspect.Parameter.empty
                                 and isinstance(ann, type)
                                 and issubclass(ann, _BaseModel)):
                             # 保留原参数名（如 params），schema 展开为 object
-                            # 这样 DeepSeek 会传 {"params": {"limit": 200}}，与 Gemini 一致
                             sub_schema = _pydantic_to_schema(ann)
                             properties[param_name] = sub_schema
+                            
                             if param.default is _inspect.Parameter.empty:
                                 required.append(param_name)
                             continue
 
                         param_type = "string"
                         if ann != _inspect.Parameter.empty:
-                            ann_str = str(ann) if not isinstance(ann, str) else ann
                             base = ann_str.replace("typing.", "").split("[")[0].strip()
                             param_type = _PY_TYPE_MAP.get(base, "string")
 
-                        properties[param_name] = {"type": param_type}
+                        prop_schema = {"type": param_type}
+                        
+                        # 修复 Array 类型的 items 属性
+                        if param_type == "array":
+                            item_type = "string"
+                            if "[" in ann_str and "]" in ann_str:
+                                inner_type = ann_str.split("[")[1].split("]")[0].strip()
+                                inner_base = inner_type.replace("typing.", "")
+                                item_type = _PY_TYPE_MAP.get(inner_base, "string")
+                            prop_schema["items"] = {"type": item_type}
+
+                        # 处理默认值
+                        if param.default is not _inspect.Parameter.empty and param.default is not None:
+                             if isinstance(param.default, (str, int, float, bool)):
+                                 prop_schema["default"] = param.default
+
+                        properties[param_name] = prop_schema
 
                         if param.default is _inspect.Parameter.empty:
                             required.append(param_name)
@@ -976,13 +1007,15 @@ class GeminiService:
                     if required:
                         final_params["required"] = required
 
+                    func_dict = {
+                        "name": func_name,
+                        "description": func_desc,
+                        "parameters": final_params,
+                    }
+
                     openai_tools.append({
                         "type": "function",
-                        "function": {
-                            "name": func_name,
-                            "description": func_desc,
-                            "parameters": final_params,
-                        }
+                        "function": func_dict
                     })
                     log.debug(f"[DeepSeek] 成功转换工具: {func_name}")
 
@@ -1034,7 +1067,7 @@ class GeminiService:
                 else:
                     openai_messages.append({"role": "user", "content": content})
 
-        # --- 4. 输出完整上下文日志（与 Gemini 路径的 LOG_AI_FULL_CONTEXT 对齐）---
+        # --- 4. 输出完整上下文日志 ---
         log_detailed = app_config.DEBUG_CONFIG.get("LOG_DETAILED_GEMINI_PROCESS", False)
         if log_detailed:
             log.info(f"--- [DeepSeek] 完整发送上下文 (用户 {user_id}) ---")
@@ -1055,6 +1088,7 @@ class GeminiService:
 
         # --- 5. 核心：带工具调用的请求循环 ---
         api_url = self.deepseek_url.rstrip("/")
+        # 不再需要自动修正 beta URL，因为用户已确认使用标准/新版 URL
         if not api_url.endswith("/chat/completions"):
              api_url += "/chat/completions"
              
@@ -1089,31 +1123,38 @@ class GeminiService:
                     result = response.json()
 
                     response_message = result["choices"][0]["message"]
+                    
                     # --- [DeepSeek] 提取并记录思考过程 ---
-                    # deepseek-reasoner 模型会将思维链放在 reasoning_content 字段中
-                    # 该字段与 content 分离，因此不会直接发送给用户
                     reasoning_content = response_message.get("reasoning_content")
+                    content = response_message.get("content") or ""
+                    tool_calls = response_message.get("tool_calls")
+
                     if reasoning_content:
                         log.info(f"--- [DeepSeek] 思考过程 ---\n{reasoning_content}\n-----------------------------")
 
-                    # 将回复加入上下文
-                    # 注意：为了避免下一次请求报错，我们需要移除 reasoning_content 字段，只保留标准 OpenAI 格式字段
-                    history_message = response_message.copy()
-                    if "reasoning_content" in history_message:
-                        del history_message["reasoning_content"]
-                    openai_messages.append(history_message)
+                    # [关键更新] 将回复加入上下文，必须包含 reasoning_content 以维持思考连续性
+                    # 根据最新文档，assistant 消息应包含 content, reasoning_content, tool_calls
+                    msg_to_append = {
+                        "role": "assistant",
+                        "content": content,
+                    }
+                    if reasoning_content is not None:
+                        msg_to_append["reasoning_content"] = reasoning_content
+                    if tool_calls is not None:
+                        msg_to_append["tool_calls"] = tool_calls
+                    
+                    openai_messages.append(msg_to_append)
 
-                    tool_calls = response_message.get("tool_calls")
-
-                    # 与 Gemini 路径保持一致：无工具调用则直接生成文本
+                    # 如果没有工具调用，说明已生成最终回复
                     if not tool_calls:
                         # --- 违禁词检测 ---
-                        raw_content = response_message.get("content", "")
-                        if raw_content and re.search(r"不过话说回来|话说回来|另外|话又说回来|不过话又说回来", raw_content):
+                        if content and re.search(r"不过话说回来|话说回来|另外|话又说回来|不过话又说回来", content):
                             if bad_format_retries < 3:
                                 log.warning(
                                     f"[DeepSeek] 检测到违禁词 '不过话说回来' (尝试 {bad_format_retries + 1}/3)。正在重试..."
                                 )
+                                # 这里我们需要把刚才 append 的 assistant 消息暂时移除，或者添加一条 system prompt 要求重试
+                                # 为了简单起见，我们添加 user 消息要求重写
                                 openai_messages.append({
                                     "role": "user",
                                     "content": "[系统提示] 检测到你使用了“不过话说回来|话说回来|另外|话又说回来”。这是被禁止的。请重新生成回复，去掉这个短语，保持语气自然。"
@@ -1123,10 +1164,9 @@ class GeminiService:
                             else:
                                 return "抱歉，我的说话格式一直达不到要求，我是杂鱼"
                         # ----------------
+                        
                         if log_detailed:
                             log.info("--- [DeepSeek] 模型决策：直接生成文本回复 (未调用工具) ---")
-                            log.info("模型返回了最终文本响应，工具调用流程结束。")
-                        raw_content = response_message.get("content", "")
                         self.last_called_tools = called_tool_names
                         log.info("--- [DeepSeek] 文本生成完成 ---")
 
@@ -1153,7 +1193,7 @@ class GeminiService:
                             except Exception as e:
                                 log.error(f"[DeepSeek] Token 记录失败: {e}")
 
-                        return await self._post_process_response(raw_content, user_id, guild_id)
+                        return await self._post_process_response(content, user_id, guild_id)
 
                     # 有工具调用
                     if log_detailed:
@@ -1222,8 +1262,10 @@ class GeminiService:
                 return "哎呀，我好像陷入了一个复杂的思考循环里，换个话题聊聊吧！"
 
         except Exception as e:
-            log.error(f"DeepSeek API 调用失败: {e}", exc_info=True)
-            return "DeepSeek 连接失败，请稍后再试。"
+            error_info = f"{type(e).__name__}: {str(e)}"
+            log.error(f"DeepSeek API 调用失败: {error_info}", exc_info=True)
+            # 返回具体错误信息给用户，方便调试
+            return f"DeepSeek 连接失败: {error_info}。请检查日志或配置。"
 
     async def _execute_generation_cycle(
         self,
