@@ -28,6 +28,7 @@ from src.chat.features.personal_memory.services.personal_memory_service import (
 from src.chat.features.chat_settings.ui.memory_settings_modal import (
     MemorySettingsModal,
 )
+from src.chat.services.gemini_service import gemini_service
 
 
 class ChatSettingsView(View):
@@ -211,6 +212,14 @@ class ChatSettingsView(View):
                 row=4,
             )
         )
+        self.add_item(
+            Button(
+                label="临时调试",
+                style=ButtonStyle.secondary,
+                custom_id="temp_debug_once",
+                row=4,
+            )
+        )
 
     async def _update_view(self, interaction: Interaction):
         """通过编辑附加的消息来刷新视图。"""
@@ -242,6 +251,8 @@ class ChatSettingsView(View):
             await self.on_ai_model_settings(interaction)
         elif custom_id == "show_token_usage":
             await self.on_show_token_usage(interaction)
+        elif custom_id == "temp_debug_once":
+            await self.on_temp_debug_once(interaction)
         elif custom_id == "memory_settings":
             await self.on_memory_settings(interaction)
 
@@ -446,6 +457,21 @@ class ChatSettingsView(View):
             on_submit_callback=modal_callback,
         )
         await interaction.response.send_modal(modal)
+
+    async def on_temp_debug_once(self, interaction: Interaction):
+        """激活一次性临时调试 URL。"""
+        debug_url = "http://host.docker.internal:1000"
+        current_model = await self.service.get_current_ai_model()
+        gemini_service.arm_one_time_debug_base_url(debug_url)
+
+        await interaction.response.send_message(
+            (
+                f"✅ 已为当前模型 **{current_model}** 启用一次性临时调试。\n"
+                f"本次将临时把 API URL 指向：`{debug_url}`\n"
+                "下一次发送生效 1 次后会自动恢复原配置。"
+            ),
+            ephemeral=True,
+        )
 
     async def on_show_token_usage(self, interaction: Interaction):
         """显示今天的 Token 使用情况。"""

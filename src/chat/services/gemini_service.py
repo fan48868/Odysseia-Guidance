@@ -2,7 +2,7 @@
 
 import os
 import logging
-from typing import Optional, Dict, List, Callable, Any, Tuple
+from typing import Optional, Dict, List, Callable, Any, Tuple, get_origin, get_args, Union
 import asyncio
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
@@ -75,10 +75,15 @@ def _api_key_handler(func: Callable) -> Callable:
     @wraps(func)
     async def wrapper(self: "GeminiService", *args, **kwargs):
         # [逻辑分流] 判断当前任务类型
-        is_embedding_task = (func.__name__ == "generate_embedding")
-        
+        is_embedding_task = func.__name__ == "generate_embedding"
+
+        # 一次性调试 URL（仅供本轮调用使用）
+        debug_base_url = kwargs.pop("debug_base_url", None)
+
         # [逻辑分流] 决定是否使用自定义通道 (非向量化 且 配置了自定义参数)
-        use_custom_channel = (not is_embedding_task) and (self.custom_chat_url and self.custom_chat_key)
+        use_custom_channel = (not is_embedding_task) and bool(self.custom_chat_key) and bool(
+            debug_base_url or self.custom_chat_url
+        )
 
         # 定义一个简单的类来模拟 key_obj，用于自定义通道场景
         class MockKeyObj:
@@ -93,19 +98,31 @@ def _api_key_handler(func: Callable) -> Callable:
             try:
                 # --- [核心修改点] 根据通道类型创建不同的 Client ---
                 if use_custom_channel:
-                    # 【通道 A：聊天】走自定义中转
+                    # 【通道 A：聊天】走自定义中转（支持一次性调试 URL 覆盖）
+                    effective_custom_url = debug_base_url or self.custom_chat_url
                     key_obj = MockKeyObj(self.custom_chat_key)
-                    # 强制使用自定义 URL
-                    http_options = types.HttpOptions(base_url=self.custom_chat_url)
-                    client = genai.Client(api_key=self.custom_chat_key, http_options=http_options)
-                    # log.info(f"使用自定义通道调用 {func.__name__}")
-                    
+                    http_options = types.HttpOptions(base_url=effective_custom_url)
+                    client = genai.Client(
+                        api_key=self.custom_chat_key, http_options=http_options
+                    )
+                    if debug_base_url:
+                        log.info(
+                            f"🧪 一次性调试已生效：{func.__name__} 临时改用 URL: {debug_base_url}"
+                        )
+
                 else:
                     # 【通道 B：向量】走官方直连 (或者是聊天回退)
                     # 从轮换服务获取官方 Key
                     key_obj = await self.key_rotation_service.acquire_key()
-                    # 强制直连 (不传 http_options，默认就是 google 官方)
-                    client = genai.Client(api_key=key_obj.key)
+                    if debug_base_url:
+                        http_options = types.HttpOptions(base_url=debug_base_url)
+                        client = genai.Client(api_key=key_obj.key, http_options=http_options)
+                        log.info(
+                            f"🧪 一次性调试已生效：{func.__name__} 临时改用官方通道 URL: {debug_base_url}"
+                        )
+                    else:
+                        # 强制直连 (不传 http_options，默认就是 google 官方)
+                        client = genai.Client(api_key=key_obj.key)
                     # log.info(f"使用官方通道调用 {func.__name__}")
 
                 # --- 下面的逻辑保留原有的重试和错误处理框架 ---
@@ -244,6 +261,9 @@ class GeminiService:
         if self.deepseek_url and self.deepseek_key:
             log.info(f"✅ 已加载 DeepSeek 配置。URL: {self.deepseek_url}")
 
+        # 一次性调试 URL（下一次发送生效一次后自动清空）
+        self._one_time_debug_base_url: Optional[str] = None
+
         # --- (新) SDK 底层调试日志 ---
         # 根据最新指南 (2025)，开启此选项可查看详细的 HTTP 请求/响应
         if app_config.DEBUG_CONFIG.get("LOG_SDK_HTTP_REQUESTS", False):
@@ -313,6 +333,19 @@ class GeminiService:
         self.tool_service.bot = bot
         self.last_called_tools: List[str] = []
         log.info("Discord Bot 实例已成功注入 ToolService。")
+
+    def arm_one_time_debug_base_url(self, base_url: str) -> None:
+        """设置一次性调试 URL：仅下一次 generate_response 生效一次。"""
+        self._one_time_debug_base_url = base_url.rstrip("/")
+        log.info(f"🧪 已激活一次性调试 URL: {self._one_time_debug_base_url}")
+
+    def consume_one_time_debug_base_url(self) -> Optional[str]:
+        """消费一次性调试 URL，并立即清空。"""
+        current = self._one_time_debug_base_url
+        self._one_time_debug_base_url = None
+        if current:
+            log.info(f"🧪 已消费一次性调试 URL: {current}")
+        return current
 
     def _create_client_with_key(self, api_key: str):
         """使用给定的 API 密钥动态创建一个 Gemini 客户端实例。"""
@@ -525,6 +558,13 @@ class GeminiService:
         AI 回复生成的分发器。
         如果选择了自定义模型，则优先尝试自定义端点；如果失败，则自动回退到官方 API。
         """
+        # 一次性调试 URL：在入口处消费，确保只生效 1 次
+        one_time_debug_base_url = self.consume_one_time_debug_base_url()
+        if one_time_debug_base_url:
+            log.info(
+                f"🧪 generate_response 已启用一次性调试 URL: {one_time_debug_base_url}，模型: {model_name or self.default_model_name}"
+            )
+
         # --- [新增] DeepSeek 专用路由 ---
         if model_name in ["deepseek-chat", "deepseek-reasoner"]:
             if self.deepseek_url and self.deepseek_key:
@@ -546,6 +586,7 @@ class GeminiService:
                     location_name=location_name,
                     model_name=model_name,
                     user_id_for_settings=user_id_for_settings,
+                    override_base_url=one_time_debug_base_url,
                 )
             else:
                 log.warning("请求使用 deepseek-chat 但未配置 DEEPSEEK_URL 或 DEEPSEEK_API_KEY。")
@@ -578,6 +619,7 @@ class GeminiService:
                         location_name=location_name,
                         model_name=model_name,
                         user_id_for_settings=user_id_for_settings,
+                        override_base_url=one_time_debug_base_url,
                     )
                 except Exception as e:
                     last_exception = e
@@ -621,6 +663,7 @@ class GeminiService:
                 location_name=location_name,
                 model_name=fallback_model_name,  # 关键：使用固定的回退模型
                 user_id_for_settings=user_id_for_settings,
+                debug_base_url=one_time_debug_base_url,
             )
 
         # 对于非自定义模型或回退失败后的默认路径
@@ -651,6 +694,7 @@ class GeminiService:
             location_name=location_name,
             model_name=model_name,
             user_id_for_settings=user_id_for_settings,
+            debug_base_url=one_time_debug_base_url,
         )
 
     async def _generate_with_custom_endpoint(
@@ -671,6 +715,7 @@ class GeminiService:
         location_name: str = "未知位置",
         model_name: Optional[str] = None,
         user_id_for_settings: Optional[str] = None,
+        override_base_url: Optional[str] = None,
     ) -> str:
         """
         [新增] 使用自定义端点 (例如公益站) 生成 AI 回复。
@@ -680,23 +725,33 @@ class GeminiService:
         if not model_name:
             raise ValueError("调用自定义端点时需要提供 model_name。")
         endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(model_name)
-        if not endpoint_config or not all(
-            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
-        ):
+        if not endpoint_config:
             error_msg = (
-                f"模型 '{model_name}' 的自定义端点配置不完整或未找到。"
+                f"模型 '{model_name}' 的自定义端点配置未找到。"
+                "请检查 CUSTOM_GEMINI_ENDPOINTS 配置。"
+            )
+            log.error(error_msg)
+            raise ValueError(error_msg)
+
+        effective_base_url = override_base_url or endpoint_config.get("base_url")
+        effective_api_key = endpoint_config.get("api_key")
+        if not effective_base_url or not effective_api_key:
+            error_msg = (
+                f"模型 '{model_name}' 的自定义端点配置不完整。"
                 "请检查 CUSTOM_GEMINI_URL_* 和 CUSTOM_GEMINI_API_KEY_* 环境变量。"
             )
             log.error(error_msg)
-            # 抛出异常以触发回退逻辑
             raise ValueError(error_msg)
 
         # --- 关键：为自定义端点单独创建客户端，不使用全局的 _create_client_with_key ---
-        log.info(f"正在为自定义端点创建客户端: {endpoint_config['base_url']}")
-        http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
-        client = genai.Client(
-            api_key=endpoint_config["api_key"], http_options=http_options
-        )
+        if override_base_url:
+            log.info(
+                f"🧪 一次性调试已生效：自定义模型 '{model_name}' 临时改用 URL: {effective_base_url}"
+            )
+        else:
+            log.info(f"正在为自定义端点创建客户端: {effective_base_url}")
+        http_options = types.HttpOptions(base_url=effective_base_url)
+        client = genai.Client(api_key=effective_api_key, http_options=http_options)
 
         # --- [重构] 针对自定义端点的图片净化 ---
         # 只有在调用自定义端点时才执行此操作，因为官方API可以处理这些图片。
@@ -862,6 +917,7 @@ class GeminiService:
         location_name: str,
         model_name: Optional[str],
         user_id_for_settings: Optional[str] = None,
+        override_base_url: Optional[str] = None,
     ) -> str:
         """
         [重构] 包含完整工具调用 (Tool Calling) 循环的 DeepSeek 专用通道。
@@ -891,15 +947,144 @@ class GeminiService:
 
         # Python 类型注解 -> JSON Schema 类型映射
         _PY_TYPE_MAP = {
-            "str": "string", "int": "integer", "float": "number",
-            "bool": "boolean", "list": "array", "dict": "object",
-            "List": "array", "Dict": "object", "Any": "string",
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+            list: "array",
+            dict: "object",
+        }
+        _STR_TYPE_MAP = {
+            "str": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "list": "array",
+            "dict": "object",
+            "List": "array",
+            "Dict": "object",
+            "Any": "string",
+            "Tuple": "array",
         }
         # 由系统注入、不暴露给模型的参数
         _INTERNAL_PARAMS = {
             "bot", "guild", "channel", "guild_id", "thread_id",
             "log_detailed", "kwargs",
         }
+
+        def _schema_from_annotation(annotation: Any) -> Dict[str, Any]:
+            """将 Python 注解转换为 JSON Schema。"""
+            if annotation is Any:
+                return {"type": "string"}
+
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+
+            # Optional[T] / T | None
+            if args and any(arg is type(None) for arg in args):
+                non_none_args = [arg for arg in args if arg is not type(None)]
+                if len(non_none_args) == 1:
+                    return _schema_from_annotation(non_none_args[0])
+
+            # List[T] / list[T]
+            if origin in (list, List, tuple, Tuple):
+                item_annotation = args[0] if args else str
+                item_schema = _schema_from_annotation(item_annotation)
+                if "type" not in item_schema:
+                    item_schema = {"type": "string"}
+                return {"type": "array", "items": item_schema}
+
+            # Dict[K, V] / dict
+            if origin in (dict, Dict):
+                return {"type": "object"}
+
+            # Union[A, B] (非 Optional 的 Union，回退 string)
+            if origin is Union:
+                return {"type": "string"}
+
+            # 直接类型（int/str/...）
+            if isinstance(annotation, type) and annotation in _PY_TYPE_MAP:
+                schema_type = _PY_TYPE_MAP[annotation]
+                if schema_type == "array":
+                    return {"type": "array", "items": {"type": "string"}}
+                return {"type": schema_type}
+
+            # 字符串注解兜底
+            if isinstance(annotation, str):
+                normalized = annotation.replace("typing.", "").strip()
+                normalized = normalized.replace("<class '", "").replace("'>", "")
+                if normalized.startswith("Optional[") and normalized.endswith("]"):
+                    return _schema_from_annotation(normalized[9:-1].strip())
+                if normalized.startswith("List[") and normalized.endswith("]"):
+                    inner = normalized[5:-1].strip()
+                    item_schema = _schema_from_annotation(inner)
+                    if "type" not in item_schema:
+                        item_schema = {"type": "string"}
+                    return {"type": "array", "items": item_schema}
+                if normalized.startswith("Dict["):
+                    return {"type": "object"}
+                mapped = _STR_TYPE_MAP.get(normalized)
+                if mapped == "array":
+                    return {"type": "array", "items": {"type": "string"}}
+                if mapped:
+                    return {"type": mapped}
+
+            return {"type": "string"}
+
+        def _is_default_type_compatible(schema_type: str, value: Any) -> bool:
+            if schema_type == "string":
+                return isinstance(value, str)
+            if schema_type == "integer":
+                return isinstance(value, int) and not isinstance(value, bool)
+            if schema_type == "number":
+                return isinstance(value, (int, float)) and not isinstance(value, bool)
+            if schema_type == "boolean":
+                return isinstance(value, bool)
+            if schema_type == "array":
+                return isinstance(value, list)
+            if schema_type == "object":
+                return isinstance(value, dict)
+            return True
+
+        def _attach_default_if_compatible(
+            prop_schema: Dict[str, Any], default_value: Any, field_path: str
+        ) -> None:
+            schema_type = prop_schema.get("type")
+            if not schema_type:
+                return
+
+            if _is_default_type_compatible(schema_type, default_value):
+                prop_schema["default"] = default_value
+                return
+
+            converted = None
+            try:
+                if schema_type == "string":
+                    converted = str(default_value)
+                elif schema_type == "integer" and isinstance(default_value, str):
+                    raw = default_value.strip()
+                    if re.fullmatch(r"[+-]?\d+", raw):
+                        converted = int(raw)
+                elif schema_type == "number" and isinstance(default_value, str):
+                    converted = float(default_value.strip())
+                elif schema_type == "boolean" and isinstance(default_value, str):
+                    lowered = default_value.strip().lower()
+                    if lowered in {"true", "false"}:
+                        converted = lowered == "true"
+            except Exception:
+                converted = None
+
+            if converted is not None and _is_default_type_compatible(schema_type, converted):
+                prop_schema["default"] = converted
+                log.warning(
+                    f"[DeepSeek Schema] 字段 '{field_path}' 的默认值类型不匹配，已自动修正为 {converted!r}。"
+                )
+                return
+
+            log.warning(
+                f"[DeepSeek Schema] 字段 '{field_path}' 的默认值 {default_value!r} "
+                f"与类型 '{schema_type}' 不匹配，已移除 default。"
+            )
 
         if dynamic_tools:
             import inspect as _inspect
@@ -914,29 +1099,19 @@ class GeminiService:
                 reqs = []
                 for field_name, field_info in model_cls.model_fields.items():
                     ann = field_info.annotation
-                    ann_str = str(ann) if ann is not None else "string"
-                    base = ann_str.replace("typing.", "").split("[")[0].strip()
-                    f_type = _PY_TYPE_MAP.get(base, "string")
                     desc = field_info.description or ""
-                    prop = {"type": f_type}
-                    
-                    # Pydantic 模型内部的 Array 类型也需要 items
-                    if f_type == "array":
-                        item_type = "string"
-                        if "[" in ann_str and "]" in ann_str:
-                            inner_type = ann_str.split("[")[1].split("]")[0].strip()
-                            inner_base = inner_type.replace("typing.", "")
-                            item_type = _PY_TYPE_MAP.get(inner_base, "string")
-                        prop["items"] = {"type": item_type}
+                    prop = _schema_from_annotation(ann)
 
-                    if field_info.default is not None:
-                        prop["default"] = field_info.default
-                            
+                    if not field_info.is_required() and field_info.default is not None:
+                        _attach_default_if_compatible(
+                            prop, field_info.default, f"{model_cls.__name__}.{field_name}"
+                        )
+
                     if desc:
                         prop["description"] = desc
-                        
+
                     props[field_name] = prop
-                    
+
                     if field_info.is_required():
                         reqs.append(field_name)
 
@@ -957,61 +1132,59 @@ class GeminiService:
                     for param_name, param in sig.parameters.items():
                         if param_name in _INTERNAL_PARAMS:
                             continue
-                        if param.kind in (_inspect.Parameter.VAR_KEYWORD,
-                                          _inspect.Parameter.VAR_POSITIONAL):
+                        if param.kind in (
+                            _inspect.Parameter.VAR_KEYWORD,
+                            _inspect.Parameter.VAR_POSITIONAL,
+                        ):
                             continue
 
                         # 检查是否是 Pydantic BaseModel 子类 → 作为嵌套 object 保留键名
                         ann = param.annotation
-                        ann_str = str(ann) if not isinstance(ann, str) else ann
-                        
-                        if (_BaseModel is not None
-                                and ann != _inspect.Parameter.empty
-                                and isinstance(ann, type)
-                                and issubclass(ann, _BaseModel)):
+
+                        if (
+                            _BaseModel is not None
+                            and ann != _inspect.Parameter.empty
+                            and isinstance(ann, type)
+                            and issubclass(ann, _BaseModel)
+                        ):
                             # 保留原参数名（如 params），schema 展开为 object
                             sub_schema = _pydantic_to_schema(ann)
                             properties[param_name] = sub_schema
-                            
+
                             if param.default is _inspect.Parameter.empty:
                                 required.append(param_name)
                             continue
 
-                        param_type = "string"
-                        if ann != _inspect.Parameter.empty:
-                            base = ann_str.replace("typing.", "").split("[")[0].strip()
-                            param_type = _PY_TYPE_MAP.get(base, "string")
+                        prop_schema = _schema_from_annotation(
+                            ann if ann != _inspect.Parameter.empty else Any
+                        )
 
-                        prop_schema = {"type": param_type}
-                        
-                        # 修复 Array 类型的 items 属性
-                        if param_type == "array":
-                            item_type = "string"
-                            if "[" in ann_str and "]" in ann_str:
-                                inner_type = ann_str.split("[")[1].split("]")[0].strip()
-                                inner_base = inner_type.replace("typing.", "")
-                                item_type = _PY_TYPE_MAP.get(inner_base, "string")
-                            prop_schema["items"] = {"type": item_type}
-
-                        # 处理默认值
-                        if param.default is not _inspect.Parameter.empty and param.default is not None:
-                             if isinstance(param.default, (str, int, float, bool)):
-                                 prop_schema["default"] = param.default
+                        # 处理默认值（必须与类型一致，或可安全转换）
+                        if (
+                            param.default is not _inspect.Parameter.empty
+                            and param.default is not None
+                            and isinstance(param.default, (str, int, float, bool, list, dict))
+                        ):
+                            _attach_default_if_compatible(
+                                prop_schema, param.default, f"{func_name}.{param_name}"
+                            )
 
                         properties[param_name] = prop_schema
 
                         if param.default is _inspect.Parameter.empty:
                             required.append(param_name)
 
-                    final_params = {"type": "object", "properties": properties}
-                    if required:
-                        final_params["required"] = required
-
                     func_dict = {
                         "name": func_name,
                         "description": func_desc,
-                        "parameters": final_params,
                     }
+
+                    # 无参数工具：省略 parameters，避免严格校验器误报
+                    if properties:
+                        final_params = {"type": "object", "properties": properties}
+                        if required:
+                            final_params["required"] = required
+                        func_dict["parameters"] = final_params
 
                     openai_tools.append({
                         "type": "function",
@@ -1087,7 +1260,11 @@ class GeminiService:
             log.info("------------------------------------")
 
         # --- 5. 核心：带工具调用的请求循环 ---
-        api_url = self.deepseek_url.rstrip("/")
+        api_url = (override_base_url or self.deepseek_url or "").rstrip("/")
+        if not api_url:
+            return "DeepSeek URL 配置缺失，请检查配置。"
+        if override_base_url:
+            log.info(f"🧪 一次性调试已生效：DeepSeek 临时改用 URL: {api_url}")
         # 不再需要自动修正 beta URL，因为用户已确认使用标准/新版 URL
         if not api_url.endswith("/chat/completions"):
              api_url += "/chat/completions"
