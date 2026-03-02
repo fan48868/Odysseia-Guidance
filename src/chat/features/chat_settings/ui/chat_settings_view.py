@@ -220,14 +220,6 @@ class ChatSettingsView(View):
                 row=4,
             )
         )
-        self.add_item(
-            Button(
-                label="重置kimi",
-                style=ButtonStyle.secondary,
-                custom_id="reset_kimi_penalties",
-                row=4,
-            )
-        )
 
     async def _update_view(self, interaction: Interaction):
         """通过编辑附加的消息来刷新视图。"""
@@ -261,8 +253,6 @@ class ChatSettingsView(View):
             await self.on_show_token_usage(interaction)
         elif custom_id == "temp_debug_once":
             await self.on_temp_debug_once(interaction)
-        elif custom_id == "reset_kimi_penalties":
-            await self.on_reset_kimi_penalties(interaction)
         elif custom_id == "memory_settings":
             await self.on_memory_settings(interaction)
 
@@ -480,21 +470,6 @@ class ChatSettingsView(View):
                 f"本次将临时把 API URL 指向：`{debug_url}`\n"
                 "下一次发送生效 1 次后会自动恢复原配置。"
             ),
-            ephemeral=True,
-        )
-
-    async def on_reset_kimi_penalties(self, interaction: Interaction):
-        """重置 Kimi 所有 key 的惩罚记录。"""
-        openai_service = getattr(gemini_service, "openai_service", None)
-        if not openai_service or not hasattr(openai_service, "reset_kimi_penalties"):
-            await interaction.response.send_message(
-                "❌ OpenAI/Kimi 服务尚未就绪，无法重置。", ephemeral=True
-            )
-            return
-
-        await openai_service.reset_kimi_penalties()
-        await interaction.response.send_message(
-            "✅ 已重置 Kimi 全部 key 的惩罚记录（冷却/次日封禁/429标记）。",
             ephemeral=True,
         )
 

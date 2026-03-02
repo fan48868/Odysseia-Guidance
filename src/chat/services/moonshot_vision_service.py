@@ -3,7 +3,8 @@
 import base64
 import logging
 import os
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -16,8 +17,32 @@ class MoonshotVisionService:
 
     def __init__(self) -> None:
         self.moonshot_url = os.getenv("MOONSHOT_URL")
-        self.moonshot_api_key = os.getenv("MOONSHOT_API_KEY")
+        self.moonshot_api_keys = self._split_api_keys(os.getenv("MOONSHOT_API_KEY"))
         self.model_name = "moonshot-v1-8k-vision-preview"
+
+    @staticmethod
+    def _split_api_keys(raw_api_keys: Optional[str]) -> List[str]:
+        """
+        解析 MOONSHOT_API_KEY：
+        - 支持逗号、中文逗号、换行分隔
+        - 自动去重与去空白
+        """
+        raw = (raw_api_keys or "").strip()
+        if not raw:
+            return []
+
+        parts = re.split(r"[,\n\r，]+", raw)
+        normalized: List[str] = []
+        seen = set()
+
+        for part in parts:
+            key = part.strip().strip('"').strip("'").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+
+        return normalized
 
     @staticmethod
     def _extract_text_from_response(data: Dict[str, Any]) -> Optional[str]:
@@ -57,8 +82,7 @@ class MoonshotVisionService:
     async def recognize_image(
         self,
         image_payload: Dict[str, Any],
-        prompt: str = 
-        "请识别这张图片的主要内容，描述关键对象、场景和文字信息，如果图片是以文字为主，**必须**完整提取全部文字，禁止自行概括/删改。"
+        prompt: str = "请识别这张图片的主要内容，描述关键对象、场景和文字信息，如果图片是以文字为主，**必须**完整提取全部文字，禁止自行概括/删改。",
     ) -> str:
         """
         识别图片内容。
@@ -71,7 +95,7 @@ class MoonshotVisionService:
             "data_preview": "<完整hex数据>"
         }
         """
-        if not self.moonshot_url or not self.moonshot_api_key:
+        if not self.moonshot_url or not self.moonshot_api_keys:
             return "（图片识别不可用：MOONSHOT_URL 或 MOONSHOT_API_KEY 未配置）"
 
         if not isinstance(image_payload, dict):
@@ -91,7 +115,11 @@ class MoonshotVisionService:
         except ValueError:
             return "（图片识别失败：data_preview 不是有效的十六进制数据）"
 
-        if isinstance(declared_size, int) and declared_size > 0 and declared_size != len(image_bytes):
+        if (
+            isinstance(declared_size, int)
+            and declared_size > 0
+            and declared_size != len(image_bytes)
+        ):
             log.warning(
                 "Moonshot 图片长度与声明不一致：declared=%s, actual=%s",
                 declared_size,
@@ -122,27 +150,65 @@ class MoonshotVisionService:
 
         api_url = self._build_api_url(self.moonshot_url)
 
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    api_url,
-                    headers={
-                        "Authorization": f"Bearer {self.moonshot_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=request_payload,
-                )
-                response.raise_for_status()
-                data = response.json()
+        last_error: Optional[str] = None
+        total_keys = len(self.moonshot_api_keys)
 
-            text = self._extract_text_from_response(data)
-            if text:
-                return text
-            return "（图片识别失败：视觉服务响应中缺少文本结果）"
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for idx, api_key in enumerate(self.moonshot_api_keys, start=1):
+                key_tail = api_key[-4:] if api_key else "????"
+                try:
+                    response = await client.post(
+                        api_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=request_payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
 
-        except Exception as e:
-            log.error("Moonshot 视觉识别失败: %s", e, exc_info=True)
-            return "（图片识别失败：视觉服务暂时不可用）"
+                    text = self._extract_text_from_response(data)
+                    if text:
+                        if idx > 1:
+                            log.warning(
+                                "Moonshot 视觉识别已切换到后续 key 成功 | key_index=%s/%s | key_tail=%s",
+                                idx,
+                                total_keys,
+                                key_tail,
+                            )
+                        return text
+
+                    last_error = "视觉服务响应中缺少文本结果"
+                    log.warning(
+                        "Moonshot 视觉识别失败，尝试下一个 key | key_index=%s/%s | key_tail=%s | reason=%s",
+                        idx,
+                        total_keys,
+                        key_tail,
+                        last_error,
+                    )
+                except Exception as e:
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status_code = e.response.status_code if e.response else "unknown"
+                        try:
+                            body_preview = (e.response.text or "")[:800] if e.response else ""
+                        except Exception:
+                            body_preview = "<无法读取响应体>"
+                        last_error = f"HTTP {status_code} | {body_preview}"
+                    else:
+                        last_error = str(e)
+
+                    log.warning(
+                        "Moonshot 视觉识别失败，尝试下一个 key | key_index=%s/%s | key_tail=%s | reason=%s",
+                        idx,
+                        total_keys,
+                        key_tail,
+                        last_error,
+                        exc_info=True,
+                    )
+
+        log.error("Moonshot 视觉识别全部 key 失败 | total_keys=%s | last_error=%s", total_keys, last_error)
+        return "（图片识别失败：视觉服务暂时不可用）"
 
 
 moonshot_vision_service = MoonshotVisionService()

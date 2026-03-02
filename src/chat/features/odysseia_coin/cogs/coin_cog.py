@@ -1,5 +1,10 @@
 import logging
+import random
+import re
+import time
+
 import discord
+import httpx
 from discord import app_commands
 from discord.ext import commands
 
@@ -10,18 +15,85 @@ from src.chat.features.odysseia_coin.service.shop_service import shop_service
 
 log = logging.getLogger(__name__)
 
+EMOJI_RE = re.compile(
+    r"((?:[\U0001F1E6-\U0001F1FF]{2})|(?:[\U0001F300-\U0001FAFF\u2600-\u27BF])(?:\uFE0F|\uFE0E)?(?:[\U0001F3FB-\U0001F3FF])?(?:\u200D(?:[\U0001F300-\U0001FAFF\u2600-\u27BF])(?:\uFE0F|\uFE0E)?(?:[\U0001F3FB-\U0001F3FF])?)*)"
+)
+
 
 class CoinCog(commands.Cog):
     """处理与类脑币相关的事件和命令"""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._react_cd_until = 0.0
+        self._react_cd_seconds = 120
+
+    async def _ask_react_ai(self, text: str):
+        cfg = chat_config.REACTION_AI
+        base_url = str(cfg.get("url", "")).rstrip("/")
+        if not base_url:
+            return None
+
+        api_url = (
+            base_url
+            if base_url.endswith("/chat/completions")
+            else f"{base_url}/chat/completions"
+        )
+
+        payload = {
+            "model": cfg.get("model", "qwen2.5:1.5b"),
+            "messages": [
+                {"role": "system", "content": cfg.get("prompt", "")},
+                {"role": "user", "content": text[:500]},
+            ],
+            "stream": False,
+            "temperature": 0.2,
+            "max_tokens": 16,
+        }
+
+        try:
+            timeout = int(cfg.get("timeout", 8))
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(api_url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            log.warning(f"[react-ai] 调用失败，跳过本次主动反应: {e}")
+            return None
+
+        try:
+            return str(data["choices"][0]["message"]["content"]).strip()
+        except Exception:
+            log.warning(f"[react-ai] 返回格式异常，跳过本次主动反应: {data}")
+            return None
+
+    def _pick_emoji(self, raw):
+        if not raw:
+            return None
+
+        match = EMOJI_RE.search(str(raw))
+        if not match:
+            return None
+
+        return match.group(0)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """监听用户每日首次发言"""
         if message.author.bot:
             return
+
+        # 自动反应：仅当消息 @ 了 bot 且包含指定关键词时，为该用户消息添加表情反应
+        trigger_keywords = ["文爱", "亲", "抱", "摸", "脚", "腿", "主人", "色色", "mua"]
+        if (
+            self.bot.user
+            and self.bot.user in message.mentions
+            and any(keyword in message.content for keyword in trigger_keywords)
+        ):
+            try:
+                await message.add_reaction("🥵")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.debug(f"自动添加反应失败（消息ID: {message.id}）: {e}")
 
         # 排除特定命令前缀的消息，避免与命令冲突
         command_prefix = self.bot.command_prefix
@@ -33,6 +105,29 @@ class CoinCog(commands.Cog):
         elif isinstance(command_prefix, (list, tuple)):
             if message.content.startswith(tuple(command_prefix)):
                 return
+
+        # 主动反应：按概率触发，调用本地模型返回 emoji
+        try:
+            rate = float(chat_config.REACTION_AI.get("rate", 0.2))
+        except Exception:
+            rate = 0.2
+
+        now = time.monotonic()
+        if now >= self._react_cd_until and rate > 0 and random.random() < rate:
+            raw = await self._ask_react_ai(message.content or "")
+            emoji = self._pick_emoji(raw)
+
+            if emoji:
+                try:
+                    await message.add_reaction(emoji)
+                    # 仅在反应成功后进入冷却
+                    self._react_cd_until = time.monotonic() + self._react_cd_seconds
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.error(
+                        f"[react-ai] 点反应失败（消息ID: {message.id}）"
+                        f" emoji={emoji!r} raw={raw!r} err={e}",
+                        exc_info=True,
+                    )
 
         try:
             reward_granted = await coin_service.grant_daily_message_reward(

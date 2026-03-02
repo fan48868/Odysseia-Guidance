@@ -191,6 +191,25 @@ MESSAGE_SETTINGS = {
     "DM_THRESHOLD": 2000,  # 当消息长度超过此值时，通过私信发送
 }
 
+# --- 主动表情反应（本地 Ollama）---
+REACTION_AI = {
+    "url": os.getenv("REACTION_AI_URL", "http://host.docker.internal:11434/v1"),
+    "model": os.getenv("REACTION_AI_MODEL", "qwen2.5:1.5b"),
+    "rate": float(os.getenv("REACTION_AI_RATE", "0.2")),  # 触发概率
+    "timeout": int(os.getenv("REACTION_AI_TIMEOUT", "8")),  # 请求超时秒数
+    "prompt": (
+        "你是表情反应专家。你现在为19岁少女机器人“神所娘”选择消息反应emoji。\n"
+        "你会收到一条用户消息。\n"
+        "规则：\n"
+        "1) 只能输出1个emoji，禁止任何文字、标点、换行、解释。\n"
+        "2) 建议从下列列表中选择：🥵 🫣 👋 ❓ 💩 🙀 😭 🤔 😅 🤣 😋 ✅ 😡 👍 👀 🙏 😿 🐷 🤨\n"
+        "3) 看不懂、抽象、疑惑内容输出❓。\n"
+        "4) 害羞/露骨/暧昧内容优先输出🥵或🫣。\n"
+        "5) 出现“fw”固定输出💩。\n"
+        "6) 如果不确定，输出❓。"
+    ),
+}
+
 GEMINI_TEXT_GEN_CONFIG = {
     "temperature": 0.1,
     "max_output_tokens": 200,
