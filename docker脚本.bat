@@ -16,7 +16,7 @@ echo ============================================
 echo          类脑娘 Docker 部署管理工具
 echo ============================================
 echo.
-echo   [1] 全量编译并启动 (up -d --build)
+echo   [1] 全量编译并启动 (up -d)
 echo   [2] 直接后台启动 (up -d)
 echo   [3] 重启机器人服务 (restart bot_app)
 echo   [4] 停止并删除容器 (down)
@@ -49,7 +49,7 @@ goto loop
 :op1
 echo.
 echo [状态] 正在全量编译并启动所有容器...
-docker compose up -d --build
+docker compose up -d 
 goto end_action
 
 :op2

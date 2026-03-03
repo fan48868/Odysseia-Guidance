@@ -12,6 +12,9 @@ from src.chat.features.odysseia_coin.service.coin_service import coin_service
 from src.chat.features.odysseia_coin.ui.shop_ui import SimpleShopView
 from src.chat.config import chat_config
 from src.chat.features.odysseia_coin.service.shop_service import shop_service
+from src.chat.features.chat_settings.services.chat_settings_service import (
+    chat_settings_service,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +50,17 @@ class CoinCog(commands.Cog):
                 {"role": "user", "content": text[:500]},
             ],
             "stream": False,
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
             "temperature": 0.2,
             "max_tokens": 16,
+            "stop": ["\n", "<think>", "</think>"],
+            # Ollama 原生参数双保险，限制输出长度并阻断思维链标记
+            "options": {
+                "num_predict": 16,
+                "temperature": 0.2,
+                "stop": ["\n", "<think>", "</think>"],
+            },
         }
 
         try:
@@ -83,51 +95,80 @@ class CoinCog(commands.Cog):
         if message.author.bot:
             return
 
-        # 自动反应：仅当消息 @ 了 bot 且包含指定关键词时，为该用户消息添加表情反应
-        trigger_keywords = ["文爱", "亲", "抱", "摸", "脚", "腿", "主人", "色色", "mua"]
-        if (
-            self.bot.user
-            and self.bot.user in message.mentions
-            and any(keyword in message.content for keyword in trigger_keywords)
-        ):
+        # 全局开关：读取 /聊天设置 的“表情反应”独立开关
+        reaction_enabled = True
+        if message.guild:
             try:
-                await message.add_reaction("🥵")
-            except (discord.Forbidden, discord.HTTPException) as e:
-                log.debug(f"自动添加反应失败（消息ID: {message.id}）: {e}")
+                reaction_key = f"reaction_enabled:{message.guild.id}"
+                reaction_raw = await chat_settings_service.db_manager.get_global_setting(
+                    reaction_key
+                )
+                reaction_enabled = (
+                    reaction_raw.lower() == "true"
+                    if reaction_raw is not None
+                    else True
+                )
+            except Exception as e:
+                log.warning(f"[react-ai] 读取表情反应开关失败，默认允许反应: {e}")
 
-        # 排除特定命令前缀的消息，避免与命令冲突
-        command_prefix = self.bot.command_prefix
-        # command_prefix can be a string, or a list/tuple of strings.
-        # startswith requires a string or a tuple of strings.
-        if isinstance(command_prefix, str):
-            if message.content.startswith(command_prefix):
-                return
-        elif isinstance(command_prefix, (list, tuple)):
-            if message.content.startswith(tuple(command_prefix)):
-                return
-
-        # 主动反应：按概率触发，调用本地模型返回 emoji
-        try:
-            rate = float(chat_config.REACTION_AI.get("rate", 0.2))
-        except Exception:
-            rate = 0.2
-
-        now = time.monotonic()
-        if now >= self._react_cd_until and rate > 0 and random.random() < rate:
-            raw = await self._ask_react_ai(message.content or "")
-            emoji = self._pick_emoji(raw)
-
-            if emoji:
+        if reaction_enabled:
+            # 自动反应：仅当消息 @ 了 bot 且包含指定关键词时，为该用户消息添加表情反应
+            trigger_keywords = [
+                "文爱",
+                "亲",
+                "抱",
+                "摸",
+                "脚",
+                "腿",
+                "主人",
+                "色色",
+                "mua",
+            ]
+            if (
+                self.bot.user
+                and self.bot.user in message.mentions
+                and any(keyword in message.content for keyword in trigger_keywords)
+            ):
                 try:
-                    await message.add_reaction(emoji)
-                    # 仅在反应成功后进入冷却
-                    self._react_cd_until = time.monotonic() + self._react_cd_seconds
+                    await message.add_reaction("🥵")
                 except (discord.Forbidden, discord.HTTPException) as e:
-                    log.error(
-                        f"[react-ai] 点反应失败（消息ID: {message.id}）"
-                        f" emoji={emoji!r} raw={raw!r} err={e}",
-                        exc_info=True,
-                    )
+                    log.debug(f"自动添加反应失败（消息ID: {message.id}）: {e}")
+
+            # 排除特定命令前缀的消息，避免与命令冲突
+            command_prefix = self.bot.command_prefix
+            # command_prefix can be a string, or a list/tuple of strings.
+            # startswith requires a string or a tuple of strings.
+            if isinstance(command_prefix, str):
+                if message.content.startswith(command_prefix):
+                    return
+            elif isinstance(command_prefix, (list, tuple)):
+                if message.content.startswith(tuple(command_prefix)):
+                    return
+
+            # 主动反应：按概率触发，调用本地模型返回 emoji
+            try:
+                rate = float(chat_config.REACTION_AI.get("rate", 0.2))
+            except Exception:
+                rate = 0.2
+
+            now = time.monotonic()
+            if now >= self._react_cd_until and rate > 0 and random.random() < rate:
+                raw = await self._ask_react_ai(message.content or "")
+                emoji = self._pick_emoji(raw)
+
+                if emoji:
+                    try:
+                        await message.add_reaction(emoji)
+                        # 仅在反应成功后进入冷却
+                        self._react_cd_until = (
+                            time.monotonic() + self._react_cd_seconds
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        log.error(
+                            f"[react-ai] 点反应失败（消息ID: {message.id}）"
+                            f" emoji={emoji!r} raw={raw!r} err={e}",
+                            exc_info=True,
+                        )
 
         try:
             reward_granted = await coin_service.grant_daily_message_reward(

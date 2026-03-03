@@ -46,6 +46,7 @@ class ChatSettingsView(View):
         self.factions: Optional[List[Dict[str, Any]]] = None
         self.selected_faction: Optional[str] = None
         self.token_usage: Optional[TokenUsage] = None
+        self.reaction_enabled: bool = True
 
     async def _initialize(self):
         """异步获取设置并构建UI。"""
@@ -59,6 +60,14 @@ class ChatSettingsView(View):
             )
         self.factions = event_service.get_event_factions()
         self.selected_faction = event_service.get_selected_faction()
+
+        # 读取“表情反应”全局开关（按 guild 维度存储在 global_settings）
+        reaction_key = f"reaction_enabled:{self.guild.id}"
+        reaction_raw = await self.service.db_manager.get_global_setting(reaction_key)
+        self.reaction_enabled = (
+            reaction_raw.lower() == "true" if reaction_raw is not None else True
+        )
+
         self._create_paginators()
         self._create_view_items()
 
@@ -136,6 +145,15 @@ class ChatSettingsView(View):
 
         self.add_item(
             Button(
+                label=f"表情反应: {'开' if self.reaction_enabled else '关'}",
+                style=ButtonStyle.green if self.reaction_enabled else ButtonStyle.red,
+                custom_id="reaction_toggle",
+                row=0,
+            )
+        )
+
+        self.add_item(
+            Button(
                 label="设置暖贴频道",
                 style=ButtonStyle.secondary,
                 custom_id="warm_up_settings",
@@ -201,7 +219,7 @@ class ChatSettingsView(View):
                 label="记忆总结频率",
                 style=ButtonStyle.secondary,
                 custom_id="memory_settings",
-                row=0,
+                row=4,
             )
         )
         self.add_item(
@@ -231,6 +249,8 @@ class ChatSettingsView(View):
 
         if custom_id == "global_chat_toggle":
             await self.on_global_toggle(interaction)
+        elif custom_id == "reaction_toggle":
+            await self.on_reaction_toggle(interaction)
         elif custom_id == "warm_up_toggle":
             await self.on_warm_up_toggle(interaction)
         elif custom_id == "warm_up_settings":
@@ -265,6 +285,16 @@ class ChatSettingsView(View):
             return
         await self.service.db_manager.update_global_chat_config(
             self.guild.id, chat_enabled=new_state
+        )
+        await self._update_view(interaction)
+
+    async def on_reaction_toggle(self, interaction: Interaction):
+        if not self.guild:
+            return
+        new_state = not self.reaction_enabled
+        reaction_key = f"reaction_enabled:{self.guild.id}"
+        await self.service.db_manager.set_global_setting(
+            reaction_key, "true" if new_state else "false"
         )
         await self._update_view(interaction)
 

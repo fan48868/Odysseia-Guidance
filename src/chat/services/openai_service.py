@@ -1023,12 +1023,6 @@ class OpenAIService:
             else:
                 log.warning(f"[{channel_label}] 获取到了工具，但转换结果为空！")
 
-        kimi_web_search_tool_description = (
-            "工具名称：$web_search。用途：联网检索与阅读网页内容。"
-            "调用条件：仅当用户明确提及“上网”，或消息中包含链接(URL)并要求查看时允许调用。"
-            "禁止条件：用户仅说“搜一下/查询一下”但未提及上网或链接时，禁止调用。"
-        )
-
         kimi_builtin_tools: List[Dict[str, Any]] = []
         if not is_deepseek_model and should_enable_kimi_web_search:
             kimi_builtin_tools = [
@@ -1092,26 +1086,6 @@ class OpenAIService:
                     is_first_user = False
                 else:
                     openai_messages.append({"role": "user", "content": content_blocks})
-
-        if not is_deepseek_model:
-            web_search_policy_prompt = (
-                "【联网工具使用规则】"
-                f"{kimi_web_search_tool_description}"
-                "若未满足条件，请直接基于已有知识回答，并明确说明未联网检索。"
-            )
-            if (
-                openai_messages
-                and openai_messages[0].get("role") == "system"
-                and isinstance(openai_messages[0].get("content"), str)
-            ):
-                openai_messages[0]["content"] = (
-                    f"{openai_messages[0]['content']}\n\n{web_search_policy_prompt}"
-                ).strip()
-            else:
-                openai_messages.insert(
-                    0,
-                    {"role": "system", "content": web_search_policy_prompt},
-                )
 
         def _truncate_data_uri_for_log(url: str) -> str:
             if not isinstance(url, str):
