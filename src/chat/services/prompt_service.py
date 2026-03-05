@@ -8,6 +8,8 @@ import io
 import json
 import re
 import discord
+import random
+import string
 
 from src.chat.config.prompts import PROMPT_CONFIG
 from src.chat.config import chat_config
@@ -29,6 +31,25 @@ class PromptService:
         初始化 PromptService。
         """
         pass
+
+    def _generate_anti_429_string(self) -> str:
+        """
+        生成一个随机的、无意义的字符串，用于添加到 system prompt 的开头，以规避基于内容重复的速率限制 (429 anit-spam)。
+        格式类似于：测试号，无实际意义:a123456b...
+        """
+        chars = string.ascii_lowercase
+        
+        parts = []
+        for _ in range(25):  # 生成25个片段，使其长度足够随机
+            part_type = random.choice(['char', 'num'])
+            if part_type == 'char':
+                parts.append(random.choice(chars))
+            else:
+                parts.append(str(random.randint(0, 999999)))
+        
+        random_sequence = "".join(parts)
+        
+        return f"测试号，无实际意义:{random_sequence}\n"
 
     def _get_model_specific_prompt(
         self, model_name: Optional[str], prompt_name: str
@@ -224,13 +245,17 @@ class PromptService:
                     log.warning(f"获取帖子首楼内容失败: {e}")
 
         # --- 新增：根据模型动态注入绕过限制的上下文 ---
-        jailbreak_user = self._get_model_specific_prompt(
+        jailbreak_user_template = self._get_model_specific_prompt(
             model_name, "JAILBREAK_USER_PROMPT"
         )
         jailbreak_model = self._get_model_specific_prompt(
             model_name, "JAILBREAK_MODEL_RESPONSE"
         )
-        if jailbreak_user and jailbreak_model:
+        if jailbreak_user_template and jailbreak_model:
+            # --- 新增：注入反429随机字符串 ---
+            anti_429_string = self._generate_anti_429_string()
+            jailbreak_user = anti_429_string + jailbreak_user_template
+            
             final_conversation.append({"role": "user", "parts": [jailbreak_user]})
             final_conversation.append({"role": "model", "parts": [jailbreak_model]})
 

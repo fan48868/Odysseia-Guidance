@@ -1564,8 +1564,9 @@ class OpenAIService:
                             return ""
 
                         if content:
+                            # 进一步增强正则，处理 </tag> 和 <tag/> 这类不规范的闭合格式
                             content = re.sub(
-                                r"<([^<>\s/]{1,20})>",
+                                r"</?((?!@)[^<>\s/]{1,20})/?(?=)>",
                                 _strip_disallowed_emoji_tag,
                                 content,
                             )
