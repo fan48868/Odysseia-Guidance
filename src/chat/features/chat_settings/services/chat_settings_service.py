@@ -74,6 +74,17 @@ class ChatSettingsService:
         config = await self.db_manager.get_global_chat_config(guild_id)
         return config["warm_up_enabled"] if config else True
 
+    async def is_global_dm_enabled(self) -> bool:
+        """检查机器人私信功能是否全局开启。"""
+        value = await self.db_manager.get_global_setting("global_dm_enabled")
+        return value.lower() == "true" if value is not None else True
+
+    async def set_global_dm_enabled(self, enabled: bool) -> None:
+        """设置机器人私信功能的全局开关。"""
+        await self.db_manager.set_global_setting(
+            "global_dm_enabled", "true" if enabled else "false"
+        )
+
     async def get_effective_channel_config(
         self, channel: discord.abc.GuildChannel
     ) -> Dict[str, Any]:

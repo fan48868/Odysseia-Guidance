@@ -83,4 +83,5 @@ AVAILABLE_AI_MODELS = [
     "deepseek-chat",
     "deepseek-reasoner",
     "kimi-k2.5",
+    "custom",
 ]

@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 class OpenAIService:
     """
-    OpenAI 兼容通道服务（DeepSeek / Kimi）。
+    OpenAI 兼容通道服务（DeepSeek / Kimi / Custom）。
     说明：
     - 本服务专门承接 OpenAI 协议调用链（messages/tools/tool_calls）。
     - 通过注入 ToolService 复用现有工具体系，避免重复加载工具。
@@ -50,6 +50,13 @@ class OpenAIService:
         # OpenAI 兼容模型配置（独立于 Gemini 配置）
         self.deepseek_url = os.getenv("DEEPSEEK_URL")
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+
+        # 自定义 OpenAI 兼容模型配置
+        self.custom_model_url = os.getenv("CUSTOM_MODEL_URL")
+        self.custom_model_api_key = (
+            os.getenv("CUSTOM_MODEL_API_KEY") or os.getenv("CUSTON_MODEL_API_KEY")
+        )
+        self.custom_model_name = os.getenv("CUSTOM_MODEL_NAME")
 
         # Kimi 网关配置：仅保留官方 MOONSHOT_*
         self.moonshot_url = os.getenv("MOONSHOT_URL")
@@ -71,6 +78,10 @@ class OpenAIService:
 
         if self.deepseek_url and self.deepseek_key:
             log.info(f"✅ [OpenAIService] 已加载 DeepSeek 配置。URL: {self.deepseek_url}")
+        if self.custom_model_url and self.custom_model_api_key and self.custom_model_name:
+            log.info(
+                f"✅ [OpenAIService] 已加载 Custom OpenAI 配置。URL: {self.custom_model_url}, Model: {self.custom_model_name}"
+            )
         if self.custom_moonshot_url and self.custom_moonshot_api_key and self.custom_moonshot_model_name:
             log.info(f"✅ [OpenAIService] 已加载 Kimi 公益站配置。URL: {self.custom_moonshot_url}, Model: {self.custom_moonshot_model_name}")
         if self.moonshot_url and self.moonshot_key:
@@ -467,6 +478,306 @@ class OpenAIService:
         }
 
     @staticmethod
+    def _is_sse_chat_completion_response(response: httpx.Response) -> bool:
+        content_type = (response.headers.get("content-type") or "").lower()
+        response_text = (response.text or "").lstrip()
+        return "text/event-stream" in content_type or response_text.startswith("data:")
+
+    @staticmethod
+    def _parse_streaming_chat_completion_body(body: str) -> Optional[Dict[str, Any]]:
+        if not body or "data:" not in body:
+            return None
+
+        response_id: Optional[str] = None
+        model_name: Optional[str] = None
+        created_ts: Optional[int] = None
+        usage_payload: Optional[Dict[str, Any]] = None
+        latest_finish_reason: Optional[str] = None
+
+        content_chunks: List[str] = []
+        reasoning_chunks: List[str] = []
+        tool_call_map: Dict[int, Dict[str, Any]] = {}
+
+        def _upsert_tool_call(
+            tool_call_payload: Dict[str, Any], fallback_index: int, from_delta: bool
+        ) -> None:
+            index = tool_call_payload.get("index", fallback_index)
+            if not isinstance(index, int):
+                index = fallback_index
+
+            existing = tool_call_map.setdefault(
+                index,
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                },
+            )
+
+            tool_call_id = tool_call_payload.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                existing["id"] = tool_call_id
+
+            tool_call_type = tool_call_payload.get("type")
+            if isinstance(tool_call_type, str) and tool_call_type:
+                existing["type"] = tool_call_type
+
+            function_payload = tool_call_payload.get("function")
+            if not isinstance(function_payload, dict):
+                return
+
+            name_value = function_payload.get("name")
+            if isinstance(name_value, str) and name_value:
+                if from_delta:
+                    existing["function"]["name"] += name_value
+                else:
+                    existing["function"]["name"] = name_value
+
+            arguments_value = function_payload.get("arguments")
+            if isinstance(arguments_value, str):
+                if from_delta:
+                    existing["function"]["arguments"] += arguments_value
+                else:
+                    existing["function"]["arguments"] = arguments_value
+            elif isinstance(arguments_value, (dict, list)):
+                existing["function"]["arguments"] = json.dumps(
+                    arguments_value, ensure_ascii=False
+                )
+
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+
+            payload_str = line[5:].strip()
+            if not payload_str or payload_str == "[DONE]":
+                continue
+
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+
+            if response_id is None and isinstance(payload.get("id"), str):
+                response_id = payload["id"]
+            if model_name is None and isinstance(payload.get("model"), str):
+                model_name = payload["model"]
+            if created_ts is None and isinstance(payload.get("created"), int):
+                created_ts = payload["created"]
+
+            if isinstance(payload.get("usage"), dict):
+                usage_payload = payload["usage"]
+
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                continue
+
+            finish_reason = first_choice.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                latest_finish_reason = finish_reason
+
+            delta = first_choice.get("delta")
+            if isinstance(delta, dict):
+                delta_content = delta.get("content")
+                if isinstance(delta_content, str):
+                    content_chunks.append(delta_content)
+
+                delta_reasoning = delta.get("reasoning_content")
+                if isinstance(delta_reasoning, str):
+                    reasoning_chunks.append(delta_reasoning)
+
+                delta_tool_calls = delta.get("tool_calls")
+                if isinstance(delta_tool_calls, list):
+                    for idx, tool_call_delta in enumerate(delta_tool_calls):
+                        if isinstance(tool_call_delta, dict):
+                            _upsert_tool_call(
+                                tool_call_delta, fallback_index=idx, from_delta=True
+                            )
+
+            # 兼容部分网关在流式 chunk 中直接给 message.tool_calls 的场景
+            message_block = first_choice.get("message")
+            if isinstance(message_block, dict):
+                message_content = message_block.get("content")
+                if isinstance(message_content, str) and message_content and not content_chunks:
+                    content_chunks.append(message_content)
+
+                message_reasoning = message_block.get("reasoning_content")
+                if (
+                    isinstance(message_reasoning, str)
+                    and message_reasoning
+                    and not reasoning_chunks
+                ):
+                    reasoning_chunks.append(message_reasoning)
+
+                message_tool_calls = message_block.get("tool_calls")
+                if isinstance(message_tool_calls, list):
+                    for idx, tool_call_message in enumerate(message_tool_calls):
+                        if isinstance(tool_call_message, dict):
+                            _upsert_tool_call(
+                                tool_call_message, fallback_index=idx, from_delta=False
+                            )
+
+        final_content = "".join(content_chunks).strip()
+        final_reasoning = "".join(reasoning_chunks).strip()
+        final_tool_calls = [
+            tool_call_map[idx]
+            for idx in sorted(tool_call_map.keys())
+            if tool_call_map[idx].get("function", {}).get("name")
+        ]
+
+        if not final_content and not final_reasoning and not final_tool_calls:
+            return None
+
+        message: Dict[str, Any] = {"role": "assistant", "content": final_content}
+        if final_reasoning:
+            message["reasoning_content"] = final_reasoning
+        if final_tool_calls:
+            message["tool_calls"] = final_tool_calls
+
+        final_finish_reason = latest_finish_reason or (
+            "tool_calls" if final_tool_calls else "stop"
+        )
+
+        result: Dict[str, Any] = {
+            "id": response_id or "custom-sse-reconstructed",
+            "object": "chat.completion",
+            "created": created_ts or int(datetime.now().timestamp()),
+            "model": model_name or "",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": final_finish_reason,
+                }
+            ],
+        }
+        if usage_payload:
+            result["usage"] = usage_payload
+
+        return result
+
+    @staticmethod
+    def _extract_json_payload_from_text(text: str) -> Optional[Any]:
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        candidate = text.strip()
+
+        # 处理 ```json ... ``` 包裹
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate)
+
+        # 1) 直接尝试
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # 2) 尝试提取对象
+        obj_start = candidate.find("{")
+        obj_end = candidate.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            obj_candidate = candidate[obj_start : obj_end + 1]
+            try:
+                return json.loads(obj_candidate)
+            except json.JSONDecodeError:
+                pass
+
+        # 3) 尝试提取数组
+        arr_start = candidate.find("[")
+        arr_end = candidate.rfind("]")
+        if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+            arr_candidate = candidate[arr_start : arr_end + 1]
+            try:
+                return json.loads(arr_candidate)
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    @staticmethod
+    def _normalize_inferred_tool_call(
+        raw_call: Any, idx: int
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw_call, dict):
+            return None
+
+        function_block = raw_call.get("function")
+        if isinstance(function_block, dict):
+            tool_name = function_block.get("name")
+            arguments_value = function_block.get("arguments", {})
+        else:
+            tool_name = (
+                raw_call.get("name")
+                or raw_call.get("tool_name")
+                or raw_call.get("function_name")
+            )
+            arguments_value = raw_call.get("arguments", raw_call.get("args", {}))
+
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return None
+
+        if isinstance(arguments_value, str):
+            arguments_str = arguments_value.strip() or "{}"
+        elif isinstance(arguments_value, (dict, list)):
+            arguments_str = json.dumps(arguments_value, ensure_ascii=False)
+        else:
+            arguments_str = "{}"
+
+        call_id = raw_call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = f"custom_tool_call_{int(datetime.now().timestamp() * 1000)}_{idx}"
+
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": tool_name.strip(),
+                "arguments": arguments_str,
+            },
+        }
+
+    @classmethod
+    def _infer_tool_calls_from_content(cls, content: str) -> Optional[List[Dict[str, Any]]]:
+        payload = cls._extract_json_payload_from_text(content)
+        if payload is None:
+            return None
+
+        raw_calls: List[Any] = []
+
+        if isinstance(payload, dict):
+            if isinstance(payload.get("tool_calls"), list):
+                raw_calls = payload["tool_calls"]
+            elif (
+                isinstance(payload.get("function"), dict)
+                and payload["function"].get("name")
+            ):
+                raw_calls = [payload]
+            elif (
+                any(k in payload for k in ("name", "tool_name", "function_name"))
+                and any(k in payload for k in ("arguments", "args"))
+            ):
+                raw_calls = [payload]
+        elif isinstance(payload, list):
+            raw_calls = payload
+
+        if not raw_calls:
+            return None
+
+        normalized_calls: List[Dict[str, Any]] = []
+        for idx, raw_call in enumerate(raw_calls):
+            normalized = cls._normalize_inferred_tool_call(raw_call, idx)
+            if normalized:
+                normalized_calls.append(normalized)
+
+        return normalized_calls or None
+
+    @staticmethod
     def _trim_kimi_messages_for_retry(
         messages: List[Dict[str, Any]], keep_recent_non_system: int = 24
     ) -> List[Dict[str, Any]]:
@@ -703,22 +1014,41 @@ class OpenAIService:
         videos: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
-        OpenAI 兼容专用通道（DeepSeek / Kimi）。
+        OpenAI 兼容专用通道（DeepSeek / Kimi / Custom）。
         """
         effective_model_name = model_name or "deepseek-chat"
         is_deepseek_model = effective_model_name in {
             "deepseek-chat",
             "deepseek-reasoner",
         }
-        channel_label = "DeepSeek" if is_deepseek_model else "Kimi"
+        is_custom_model = effective_model_name == "custom"
+        is_kimi_model = effective_model_name == "kimi-k2.5"
+        is_direct_openai_model = is_deepseek_model or is_custom_model
+
+        if is_deepseek_model:
+            channel_label = "DeepSeek"
+        elif is_custom_model:
+            channel_label = "Custom"
+        else:
+            channel_label = "Kimi"
 
         # 选择目标网关配置
         if is_deepseek_model:
             target_base_url = self.deepseek_url
             target_api_key = self.deepseek_key
             if not (target_base_url and target_api_key):
-                log.warning(f"请求使用 {effective_model_name} 但未配置 DEEPSEEK_URL 或 DEEPSEEK_API_KEY。")
+                log.warning(
+                    f"请求使用 {effective_model_name} 但未配置 DEEPSEEK_URL 或 DEEPSEEK_API_KEY。"
+                )
                 return "DeepSeek 配置缺失，请检查环境变量。"
+        elif is_custom_model:
+            target_base_url = self.custom_model_url
+            target_api_key = self.custom_model_api_key
+            if not (target_base_url and target_api_key and self.custom_model_name):
+                log.warning(
+                    "请求使用 custom 但未配置 CUSTOM_MODEL_URL / CUSTOM_MODEL_API_KEY / CUSTOM_MODEL_NAME。"
+                )
+                return "custom 配置缺失，请检查 CUSTOM_MODEL_URL、CUSTOM_MODEL_API_KEY、CUSTOM_MODEL_NAME。"
         else:
             target_base_url = None
             target_api_key = None
@@ -726,11 +1056,11 @@ class OpenAIService:
                 log.warning("请求使用 kimi-k2.5 但未配置 MOONSHOT_URL 或 MOONSHOT_API_KEY。")
                 return "Kimi 配置缺失，请检查 MOONSHOT_URL 与 MOONSHOT_API_KEY 环境变量。"
 
-        if not is_deepseek_model:
+        if is_kimi_model:
             log.info("[Kimi] 本轮回复将使用官方 key 轮询。")
 
         should_enable_kimi_web_search = False
-        if not is_deepseek_model:
+        if is_kimi_model:
             should_enable_kimi_web_search = self._should_enable_kimi_web_search(
                 message=message,
                 replied_message=replied_message,
@@ -1147,7 +1477,7 @@ class OpenAIService:
                 log.warning(f"[{channel_label}] 获取到了工具，但转换结果为空！")
 
         kimi_builtin_tools: List[Dict[str, Any]] = []
-        if not is_deepseek_model and should_enable_kimi_web_search:
+        if is_kimi_model and should_enable_kimi_web_search:
             kimi_builtin_tools = [
                 {
                     "type": "builtin_function",
@@ -1178,6 +1508,7 @@ class OpenAIService:
         for turn in final_conversation:
             gemini_role = turn.get("role")
 
+            # DeepSeek：沿用原有 OCR 拼接为纯文本
             if is_deepseek_model:
                 content = await self._build_deepseek_turn_content(turn.get("parts", []) or [])
                 if not content:
@@ -1193,6 +1524,7 @@ class OpenAIService:
                         openai_messages.append({"role": "user", "content": content})
                 continue
 
+            # Kimi / Custom：直接发送多模态 content block（图片直传，不走 Moonshot OCR）
             content_blocks = self._build_kimi_turn_content(turn.get("parts", []) or [])
             if not content_blocks:
                 continue
@@ -1210,10 +1542,10 @@ class OpenAIService:
                 else:
                     openai_messages.append({"role": "user", "content": content_blocks})
 
-        if is_deepseek_model and videos:
-            log.info("[DeepSeek] 收到视频输入，但当前仅 Kimi 分支支持视频解析，已忽略。")
+        if is_direct_openai_model and videos:
+            log.info(f"[{channel_label}] 收到视频输入，但当前仅 Kimi 分支支持视频解析，已忽略。")
 
-        if not is_deepseek_model and videos:
+        if is_kimi_model and videos:
             video_blocks = self._build_kimi_video_content_blocks(videos)
             if video_blocks:
                 appended_to_existing_user = False
@@ -1277,9 +1609,12 @@ class OpenAIService:
             log.info(f"--- [{channel_label}] 完整发送上下文 (用户 {user_id}) ---")
             log.info(json.dumps(safe_openai_messages, ensure_ascii=False, indent=2, default=str))
 
-            request_tools_for_log = (
-                openai_tools if is_deepseek_model else (openai_tools + kimi_builtin_tools)
-            )
+            if is_deepseek_model or is_custom_model:
+                request_tools_for_log = openai_tools
+            elif is_kimi_model:
+                request_tools_for_log = openai_tools + kimi_builtin_tools
+            else:
+                request_tools_for_log = []
             if request_tools_for_log:
                 log.info(f"--- [{channel_label}] 工具列表 ---")
                 log.info(
@@ -1293,7 +1628,7 @@ class OpenAIService:
         api_url = ""
         api_key = ""
 
-        if is_deepseek_model:
+        if is_direct_openai_model:
             api_url = (override_base_url or target_base_url or "").rstrip("/")
             api_key = target_api_key or ""
 
@@ -1303,7 +1638,7 @@ class OpenAIService:
                 return "OpenAI 兼容通道 API Key 配置缺失，请检查配置。"
 
             if override_base_url:
-                log.info(f"🧪 一次性调试已生效：OpenAI 兼容通道临时改用 URL: {api_url}")
+                log.info(f"🧪 一次性调试已生效：{channel_label} 通道临时改用 URL: {api_url}")
 
             api_url = self._build_chat_completions_url(api_url)
         elif override_base_url:
@@ -1327,9 +1662,12 @@ class OpenAIService:
         try:
             async with httpx.AsyncClient(timeout=120.0) as http_client:
                 for i in range(max_calls):
-                    request_model_name = (
-                        effective_model_name if is_deepseek_model else self.kimi_model
-                    )
+                    if is_deepseek_model:
+                        request_model_name = effective_model_name
+                    elif is_custom_model:
+                        request_model_name = self.custom_model_name or effective_model_name
+                    else:
+                        request_model_name = self.kimi_model
 
                     payload = {
                         "model": request_model_name,
@@ -1340,13 +1678,16 @@ class OpenAIService:
                         "max_tokens": gen_config.get("max_output_tokens", 8192),
                     }
 
-                    if not is_deepseek_model:
+                    if is_kimi_model:
                         payload["thinking"] = {"type": "disabled"}
 
-                    if is_deepseek_model:
+                    if is_deepseek_model or is_custom_model:
                         if openai_tools:
                             payload["tools"] = openai_tools
-                    else:
+                            if is_custom_model:
+                                payload["tool_choice"] = "auto"
+                                payload["parallel_tool_calls"] = True
+                    elif is_kimi_model:
                         kimi_request_tools: List[Dict[str, Any]] = []
                         if openai_tools:
                             kimi_request_tools.extend(openai_tools)
@@ -1356,12 +1697,12 @@ class OpenAIService:
                             payload["tools"] = kimi_request_tools
 
                     used_api_url = api_url
-                    used_slot_label = "deepseek"
+                    used_slot_label = "deepseek" if is_deepseek_model else "custom"
                     used_kimi_slot_id: Optional[str] = None
                     used_kimi_key_tail = "N/A"
                     used_kimi_model_name = request_model_name
 
-                    if is_deepseek_model:
+                    if is_direct_openai_model:
                         response = await http_client.post(
                             api_url,
                             headers={
@@ -1370,9 +1711,9 @@ class OpenAIService:
                             },
                             json=payload,
                         )
-                        response.raise_for_status() # Deepseek 失败直接抛异常
-                    
-                    else: # Kimi 逻辑
+                        response.raise_for_status()  # 直连通道失败直接抛异常
+
+                    else:  # Kimi 逻辑
                         # 标志位，用于决定是否需要 fallback 到官方站
                         fallback_to_official = False
                         
@@ -1462,7 +1803,7 @@ class OpenAIService:
                                 override_base_url=override_base_url,
                             )
 
-                    if response.is_error and not is_deepseek_model:
+                    if response.is_error and is_kimi_model:
                         response_text = response.text or ""
                         lowered_response_text = response_text.lower()
                         if (
@@ -1486,13 +1827,25 @@ class OpenAIService:
 
                     response.raise_for_status()
 
+                    result: Optional[Dict[str, Any]] = None
+                    if is_custom_model and self._is_sse_chat_completion_response(response):
+                        result = self._parse_streaming_chat_completion_body(
+                            response.text or ""
+                        )
+                        if not result:
+                            log.error(
+                                "[Custom] 流式响应解析失败：无法从 SSE 数据中重建有效消息。"
+                            )
+                            return "custom 通道返回了无法解析的流式响应，请稍后再试。"
+
                     try:
-                        result = response.json()
+                        if result is None:
+                            result = response.json()
                     except json.JSONDecodeError:
                         response_text = (response.text or "").strip()
                         lowered_response_text = response_text.lower()
 
-                        if not is_deepseek_model and used_kimi_slot_id:
+                        if is_kimi_model and used_kimi_slot_id:
                             if "tpd" in lowered_response_text:
                                 await self._notify_kimi_alert("当前官方key出现TPD报错")
                                 until_ts = await self.kimi_key_rotation.report_tpd(used_kimi_slot_id)
@@ -1533,7 +1886,7 @@ class OpenAIService:
                                     )
                                 continue
 
-                        if not is_deepseek_model:
+                        if is_kimi_model:
                             body_preview = response_text[:1200] if response_text else "<empty>"
                             content_type = response.headers.get("content-type", "<none>")
                             server = response.headers.get("server", "<none>")
@@ -1550,12 +1903,50 @@ class OpenAIService:
                             )
                             return "Kimi 通道返回了非标准响应（非 JSON），请稍后再试。"
 
+                        if is_custom_model:
+                            body_preview = response_text[:1200] if response_text else "<empty>"
+                            content_type = response.headers.get("content-type", "<none>")
+                            server = response.headers.get("server", "<none>")
+                            log.error(
+                                "[Custom] 返回非 JSON 响应 | status=%s | content_type=%s | server=%s | "
+                                "url=%s | body=%s",
+                                response.status_code,
+                                content_type,
+                                server,
+                                used_api_url,
+                                body_preview,
+                            )
+                            return "custom 通道返回了非标准响应（非 JSON），请稍后再试。"
+
                         raise
 
-                    response_message = result["choices"][0]["message"]
+                    first_choice = result["choices"][0]
+                    response_message = first_choice.get("message")
+                    if not isinstance(response_message, dict):
+                        response_message = (
+                            first_choice.get("delta")
+                            if isinstance(first_choice.get("delta"), dict)
+                            else {}
+                        )
+
                     reasoning_content = response_message.get("reasoning_content")
                     content = response_message.get("content") or ""
                     tool_calls = response_message.get("tool_calls")
+
+                    if (
+                        is_custom_model
+                        and not tool_calls
+                        and isinstance(content, str)
+                        and content.strip()
+                    ):
+                        inferred_tool_calls = self._infer_tool_calls_from_content(content)
+                        if inferred_tool_calls:
+                            tool_calls = inferred_tool_calls
+                            content = ""
+                            log.info(
+                                "[Custom] 响应未返回标准 tool_calls，已从 JSON 文本中推断出 %s 个工具调用。",
+                                len(inferred_tool_calls),
+                            )
 
                     if reasoning_content:
                         log.info(

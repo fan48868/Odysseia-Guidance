@@ -567,7 +567,7 @@ class GeminiService:
             )
 
         # --- OpenAI 兼容专用路由（DeepSeek / Kimi） ---
-        if model_name in ["deepseek-chat", "deepseek-reasoner", "kimi-k2.5"]:
+        if model_name in ["deepseek-chat", "deepseek-reasoner", "kimi-k2.5", "custom"]:
             log.info(f"检测到 {model_name} 模型，切换至 OpenAIService。")
             result = await self.openai_service.generate_response(
                 user_id=user_id,

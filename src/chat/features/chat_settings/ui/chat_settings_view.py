@@ -47,6 +47,7 @@ class ChatSettingsView(View):
         self.selected_faction: Optional[str] = None
         self.token_usage: Optional[TokenUsage] = None
         self.reaction_enabled: bool = True
+        self.dm_enabled: bool = True
 
     async def _initialize(self):
         """异步获取设置并构建UI。"""
@@ -67,6 +68,9 @@ class ChatSettingsView(View):
         self.reaction_enabled = (
             reaction_raw.lower() == "true" if reaction_raw is not None else True
         )
+
+        dm_raw = await self.service.db_manager.get_global_setting("global_dm_enabled")
+        self.dm_enabled = dm_raw.lower() == "true" if dm_raw is not None else True
 
         self._create_paginators()
         self._create_view_items()
@@ -133,16 +137,6 @@ class ChatSettingsView(View):
             )
         )
 
-        warm_up_enabled = self.settings.get("global", {}).get("warm_up_enabled", True)
-        self.add_item(
-            Button(
-                label=f"暖贴功能: {'开' if warm_up_enabled else '关'}",
-                style=ButtonStyle.green if warm_up_enabled else ButtonStyle.red,
-                custom_id="warm_up_toggle",
-                row=0,
-            )
-        )
-
         self.add_item(
             Button(
                 label=f"表情反应: {'开' if self.reaction_enabled else '关'}",
@@ -154,9 +148,9 @@ class ChatSettingsView(View):
 
         self.add_item(
             Button(
-                label="设置暖贴频道",
-                style=ButtonStyle.secondary,
-                custom_id="warm_up_settings",
+                label=f"私信开关: {'开' if self.dm_enabled else '关'}",
+                style=ButtonStyle.green if self.dm_enabled else ButtonStyle.red,
+                custom_id="global_dm_toggle",
                 row=0,
             )
         )
@@ -253,6 +247,8 @@ class ChatSettingsView(View):
             await self.on_reaction_toggle(interaction)
         elif custom_id == "warm_up_toggle":
             await self.on_warm_up_toggle(interaction)
+        elif custom_id == "global_dm_toggle":
+            await self.on_global_dm_toggle(interaction)
         elif custom_id == "warm_up_settings":
             await self.on_warm_up_settings(interaction)
         elif (
@@ -305,6 +301,13 @@ class ChatSettingsView(View):
             return
         await self.service.db_manager.update_global_chat_config(
             self.guild.id, warm_up_enabled=new_state
+        )
+        await self._update_view(interaction)
+
+    async def on_global_dm_toggle(self, interaction: Interaction):
+        new_state = not self.dm_enabled
+        await self.service.db_manager.set_global_setting(
+            "global_dm_enabled", "true" if new_state else "false"
         )
         await self._update_view(interaction)
 

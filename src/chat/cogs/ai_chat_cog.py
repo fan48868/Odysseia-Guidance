@@ -18,9 +18,13 @@ from src.chat.features.tools.functions.summarize_channel import text_to_summary_
 # 导入上下文服务
 
 # 导入数据库管理器以进行黑名单检查和斜杠命令
+from src import config
 from src.chat.utils.database import chat_db_manager
 from src.chat.config.chat_config import CHAT_ENABLED, MESSAGE_SETTINGS
 from src.chat.config import chat_config
+from src.chat.features.chat_settings.services.chat_settings_service import (
+    chat_settings_service,
+)
 from src.chat.features.odysseia_coin.service.coin_service import coin_service
 
 log = logging.getLogger(__name__)
@@ -93,6 +97,15 @@ class AIChatCog(commands.Cog):
 
         if not is_dm and not is_mentioned:
             return
+
+        # 新增：私信总开关（开发者豁免）
+        if is_dm:
+            dm_enabled = await chat_settings_service.is_global_dm_enabled()
+            if not dm_enabled and message.author.id not in config.DEVELOPER_USER_IDS:
+                log.info(
+                    f"私信总开关已关闭，用户 {message.author.id} 非开发者，跳过私信处理。"
+                )
+                return
 
         # 新增：检查是否在帖子中，以及帖子创建者是否禁用了回复
         if isinstance(message.channel, discord.Thread):
