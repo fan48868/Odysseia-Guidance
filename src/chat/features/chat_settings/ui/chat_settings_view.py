@@ -338,8 +338,13 @@ class ChatSettingsView(View):
 
         await self._update_view(interaction)
 
-    async def on_entity_select(self, interaction: Interaction, values: List[str]):
+    async def on_entity_select(self, interaction: Interaction):
         """统一处理频道和分类的选择事件。"""
+        if not interaction.data or "values" not in interaction.data:
+            await interaction.response.defer()
+            return
+
+        values = interaction.data["values"]
         if not values or values[0] == "disabled":
             await interaction.response.defer()
             return

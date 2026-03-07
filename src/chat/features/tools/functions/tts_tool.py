@@ -24,6 +24,24 @@ def detect_language(text: str) -> str:
         return "ko-KR"
     return "zh-CN"
 
+def adjust_pitch_hz(pitch: str, delta_hz: int) -> str:
+    """
+    在原有 pitch 基础上增减 Hz。
+    输入格式要求为 '[+/-]NHz'，如 '+25Hz'、'-10Hz'。
+    若格式不匹配则返回原值。
+    """
+    match = re.fullmatch(r'([+-]?)(\d+)Hz', pitch.strip())
+    if not match:
+        return pitch
+
+    sign, value_str = match.groups()
+    base = int(value_str)
+    if sign == "-":
+        base = -base
+
+    adjusted = base + delta_hz
+    return f"{adjusted:+d}Hz"
+
 class TTSParams(BaseModel):
     text: str = Field(..., description="要转换成语音的文字内容。")
     filename: Optional[str] = Field(None, description="音频文件的名字。请根据内容生成一个10字以内的标题，如'余额播报'、'主人亲启'等。")
@@ -53,6 +71,7 @@ async def tts_tool(
     [参数利用指南]
     - **rate (语速)**: 范围在 -50% 到 +100% 之间。增加数值会让表达更急促、活泼；减少数值会让表达更沉稳、迟缓。
     - **pitch (音调)**: 范围建议在 +10Hz 到 +50Hz 之间。增加数值会让声音更清脆、年轻；减少数值会让声音更雄浑、成熟。
+    - 推荐使用: rate +15% ,pitch +25Hz。
     - 你可以根据当前的对话语境，自主组合这两个参数以达到最自然的表达效果。
 
     [情绪输出指南]
@@ -81,8 +100,10 @@ async def tts_tool(
     try:
         # 根据文本内容自动选择语音
         lang = detect_language(params.text)
+        speech_pitch = params.pitch
         if lang == "ja-JP":
             voice = "ja-JP-NanamiNeural"
+            speech_pitch = adjust_pitch_hz(params.pitch, 20)
         elif lang == "ko-KR":
             voice = "ko-KR-SunHiNeural"
         else:
@@ -92,7 +113,7 @@ async def tts_tool(
             text=params.text,
             voice=voice,
             rate=params.rate,
-            pitch=params.pitch
+            pitch=speech_pitch
         )
 
         audio_data = io.BytesIO()
