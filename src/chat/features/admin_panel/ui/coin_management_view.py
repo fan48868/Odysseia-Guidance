@@ -1,5 +1,3 @@
-# src/chat/features/admin_panel/ui/coin_management_view.py
-
 # -*- coding: utf-8 -*-
 import discord
 from discord.ui import View, Button
@@ -49,22 +47,16 @@ class CoinManagementView(View):
         """根据当前状态更新按钮的可见性和禁用状态"""
         self.clear_items()
 
-        # [修复] 修正导入路径：从 views 子目录导入 DBManagementView
-        try:
-            from src.chat.features.admin_panel.ui.views.db_management_view import DBManagementView
-        except ImportError:
-            # 备用方案：如果文件名是 db_view.py
-            from src.chat.features.admin_panel.ui.views.db_view import DBManagementView
-
         # 添加返回数据库浏览器主界面的按钮
+        from src.chat.features.admin_panel.ui.db_view_ui import DBView
+
         back_button = Button(
             label="返回数据库浏览器", style=discord.ButtonStyle.grey, emoji="⬅️", row=4
         )
 
         async def back_callback(interaction: discord.Interaction):
             await interaction.response.defer()
-            # [修复] 使用正确的类名 DBManagementView
-            view = DBManagementView(self.main_interaction.user.id)
+            view = DBView(self.main_interaction.user.id)
             view.message = self.message
             await view.update_view()
 

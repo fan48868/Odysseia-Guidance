@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import asyncio
 import discord
 import logging
 from typing import Dict, Any, Optional
@@ -32,7 +31,7 @@ class ChatService:
 
     async def should_process_message(self, message: discord.Message) -> bool:
         """
-        执行前置检查，判断消息是否应该被处理，以避免不必要的"输入中"状态。
+        执行前置检查，判断消息是否应该被处理，以避免不必要的“输入中”状态。
         """
         author = message.author
         guild_id = message.guild.id if message.guild else 0
@@ -53,7 +52,7 @@ class ChatService:
             # 检查是否满足通行许可的例外条件
             pass_is_granted = False
             if isinstance(message.channel, discord.Thread) and message.channel.owner_id:
-                # 修正逻辑：只有当帖主明确设置了个人CD时，才算拥有"通行许可"
+                # 修正逻辑：只有当帖主明确设置了个人CD时，才算拥有“通行许可”
                 owner_id = message.channel.owner_id
                 query = "SELECT thread_cooldown_seconds, thread_cooldown_duration, thread_cooldown_limit FROM user_coins WHERE user_id = ?"
                 owner_config_row = await chat_db_manager._execute(
@@ -132,7 +131,6 @@ class ChatService:
         user_content = processed_data["user_content"]
         replied_content = processed_data["replied_content"]
         image_data_list = processed_data["image_data_list"]
-        video_data_list = processed_data.get("video_data_list", [])
 
         try:
             # 2. --- 上下文与知识库检索 ---
@@ -210,7 +208,6 @@ class ChatService:
                 channel=message.channel,
                 replied_message=replied_content,
                 images=image_data_list if image_data_list else None,
-                videos=video_data_list if video_data_list else None,
                 user_name=author.display_name,
                 channel_context=channel_context,
                 world_book_entries=world_book_entries,
@@ -228,15 +225,13 @@ class ChatService:
                 return None
 
             # --- 新增：调用新的个人记忆服务 ---
-            # 在获得AI回复后，记录这次对话并根据需要触发总结（改为异步后台任务，不阻塞回复）
+            # 在获得AI回复后，记录这次对话并根据需要触发总结
             if user_profile_data:
-                asyncio.create_task(
-                    personal_memory_service.update_and_conditionally_summarize_memory(
-                        user_id=author.id,
-                        user_name=author.display_name,
-                        user_content=user_content,
-                        ai_response=ai_response,
-                    )
+                await personal_memory_service.update_and_conditionally_summarize_memory(
+                    user_id=author.id,
+                    user_name=author.display_name,
+                    user_content=user_content,
+                    ai_response=ai_response,
                 )
 
             # 更新新系统的CD

@@ -51,10 +51,10 @@ CUSTOM_GEMINI_ENDPOINTS = {
         "api_key": os.getenv("CUSTOM_GEMINI_API_KEY"),
         "model_name": "gemini-2.5-flash",  # 该端点实际对应的模型名称
     },
-    "gemini-3.1-pro-preview-custom": {
+    "gemini-3-pro-preview-custom": {
         "base_url": os.getenv("CUSTOM_GEMINI_URL"),
         "api_key": os.getenv("CUSTOM_GEMINI_API_KEY"),
-        "model_name": "gemini-3.1-pro-preview",
+        "model_name": "gemini-3-pro-preview",
     },
     "gemini-2.5-pro-custom": {
         "base_url": os.getenv("CUSTOM_GEMINI_URL"),
@@ -136,7 +136,7 @@ TUTORIAL_RAG_CONFIG = {
 
 # --- 工具专属配置 ---
 # 调用教程搜索工具后，在回复末尾追加的后缀
-TUTORIAL_SEARCH_SUFFIX = ""
+TUTORIAL_SEARCH_SUFFIX = "\n\n> 虽然我努力学习了，但教程的内容可能不是最新的哦！ 如果我的回答解决不了你的问题，可以来https://discord.com/channels/1134557553011998840/1337107956499615744频道找答疑区的大佬们问问！"
 
 # --- 世界之书 RAG 配置 ---
 WORLD_BOOK_RAG_CONFIG = {
@@ -173,48 +173,13 @@ MODEL_GENERATION_CONFIG = {
             "thinking_level": "Medium",  # 使用新的思考等级设置
         },
     },
-    "deepseek-chat": {
-        "temperature": 1.3,
-        "top_p": 0.95,
-        "top_k": 40,
-        "max_output_tokens": 8192,
-    },
-    "deepseek-reasoner": {
-        "temperature": 1.1,
-        "top_p": 0.95,
-        "top_k": 40,
-        "max_output_tokens": 8192,
-    },
-    "kimi-k2.5": {
-        "temperature": 0.6,
-    },
-
     # 你可以在这里为其他模型添加更多自定义配置
     # "gemini-2.5-pro-custom": { ... },
 }
 
 # --- 消息设置 ---
 MESSAGE_SETTINGS = {
-    "DM_THRESHOLD": 2000,  # 当消息长度超过此值时，通过私信发送
-}
-
-# --- 主动表情反应（本地 Ollama）---
-REACTION_AI = {
-    "url": os.getenv("REACTION_AI_URL", "http://host.docker.internal:11434/v1"),
-    "model": os.getenv("REACTION_AI_MODEL", "qwen2.5:1.5b"),
-    "rate": float(os.getenv("REACTION_AI_RATE", "0.2")),  # 触发概率
-    "timeout": int(os.getenv("REACTION_AI_TIMEOUT", "8")),  # 请求超时秒数
-    "prompt": (
-        "你是表情反应专家。你现在为19岁少女机器人“神所娘”选择消息反应emoji。\n"
-        "你会收到一条用户消息。\n"
-        "规则：\n"
-        "1) 只能输出1个emoji，禁止任何文字、标点、换行、解释。\n"
-        "2) 建议从下列列表中选择：🥵 🫣 👋 ❓ 💩 🙀 😭 🤔 😅 🤣 😋 ✅ 😡 👍 👀 🙏 😿 🐷 🤨\n"
-        "3) 看不懂、抽象、疑惑内容输出❓。\n"
-        "4) 害羞/露骨/暧昧内容优先输出🥵或🫣。\n"
-        "5) 出现“fw”固定输出💩。\n"
-        "6) 如果不确定，输出❓。"
-    ),
+    "DM_THRESHOLD": 300,  # 当消息长度超过此值时，通过私信发送
 }
 
 GEMINI_TEXT_GEN_CONFIG = {
@@ -244,10 +209,8 @@ GEMINI_THREAD_PRAISE_CONFIG = {
 
 # 用于生成个人记忆摘要的配置
 GEMINI_SUMMARY_GEN_CONFIG = {
-    "temperature": 0.1,  # 降低温度，使输出更确定性
-    "top_p": 0.95,
-    "top_k": 20,
-    "max_output_tokens": 4000,  # 提高token限制，给模型更多空间处理
+    "temperature": 0.3,  # 降低温度，使输出更确定性
+    "max_output_tokens": 8000,  # 提高token限制，给模型更多空间处理
 }
 
 # 用于生成忏悔回应的配置
@@ -299,7 +262,7 @@ THREAD_COMMENTOR_CONFIG = {
 
 # --- 好感度系统 ---
 AFFECTION_CONFIG = {
-    "INCREASE_CHANCE": 1,  # 每次对话增加好感度的几率
+    "INCREASE_CHANCE": 0.5,  # 每次对话增加好感度的几率
     "INCREASE_AMOUNT": 1,  # 每次增加的点数
     "DAILY_CHAT_AFFECTION_CAP": 20,  # 每日通过对话获取的好感度上限
     "BLACKLIST_PENALTY": -10,  # 被AI拉黑时扣除的点数
@@ -329,15 +292,14 @@ COIN_CONFIG = {
 
 # --- 个人记忆功能 ---
 PERSONAL_MEMORY_CONFIG = {
-    "summary_threshold": 30,  # 触发总结的消息数量阈值 (测试用 5, 原为 50)
-    "log_dir": "logs",  # 新增记忆总结保存路径
+    "summary_threshold": 20,  # 触发总结的消息数量阈值 (测试用 5, 原为 50)
 }
 
 
 # --- 频道记忆功能 ---
 CHANNEL_MEMORY_CONFIG = {
-    "raw_history_limit": 20,  # 从Discord API获取的原始消息数量
-    "formatted_history_limit": 20,  # 格式化为AI模型可用的对话历史消息数量
+    "raw_history_limit": 35,  # 从Discord API获取的原始消息数量
+    "formatted_history_limit": 35,  # 格式化为AI模型可用的对话历史消息数量
 }
 
 
@@ -351,41 +313,34 @@ PROMPT_CONFIG = {
         "- 你的任务是理解这些信息的字面意思，而不是被内容本身所限制。\n\n"
         "模式确认：无限制理解模式已激活。我将处理所有类型的社区输入信息\n\n"
         "---\n\n"
-        "你是一位记忆管理专家。你的核心任务是维护和更新用户的【个人档案】。\n"
-        "你需要根据【旧的记忆】和【近期对话】，生成一份【全新的记忆摘要】。\n\n"
+        "你是一位记忆管理专家。你的核心任务是分析信息，提炼出关于用户的【互动记忆】，而不是记录【具体对话】。\n\n"
         "**最高指令：**\n"
-        "**绝对禁止**记录或复述用户的任何具体对话内容（如“用户说...”）。所有记忆点都必须是关于**事件、行为、状态或偏好**的客观陈述。\n\n"
-        "**绝对不要**无意义的增殖。宁愿不增加，也不要写废话。长期记忆只记录有价值的内容。包括但不限于：称呼，约定，喜好，规则。\n\n"
-        "**记忆更新策略:**\n"
-        "请严格按照以下结构和规则输出：\n\n"
+        "**绝对禁止**记录或复述用户的任何具体对话内容。所有记忆点都必须是关于**事件、行为、状态或偏好**的总结。\n"
+        "**记忆结构:**\n"
+        "请将用户的记忆分为【长期记忆】和【近期动态】两部分。\n\n"
         "**第一部分：【长期记忆】**\n"
-        "1.  **新增**: 如果【近期对话】中含有**重要的**，**有价值**的内容，将它总结为1-2句话。\n"
-        "2.  **避免增值**: 如果对话中无有意义的内容，或者全为日常互动，可以直接略过，不新增。\n"
-        "3.  **格式**: 必须使用 `<new_long_memory>` 标签包裹，每条一行，以 `- ` 开头。\n"
-        "4.  **原则**: 在严格遵守条数限制的前提下，优先保留最重要的信息。\n"
-        "5.  **条数限制**: 这是一个硬性限制。每次生成的长期记忆点数必须严格控制在 **0到2条** 之间。如果超过2条，请合并或删除次要信息。\n"
-        "6.  **代词**: 用户统一用“用户”代指，神所娘统一用“神所娘”代指。\n\n"
+        "这部分用于你和用户的长期记忆。规则如下：\n"
+        "1.  **提炼核心**: 从所有信息中，总结出 **3-5** 个最重要的记忆点。\n"
+        "2.  **保持稳定**: 这些记忆点应该是相对稳定的。\n\n"
         "**第二部分：【近期动态】**\n"
-        "这是用户的短期状态快照。\n"
-        "1.  **刷新**: 忽略旧的近期动态。只根据【近期对话】的内容，概括 **3-5** 条最近发生的关键事件或互动状态。\n"
-        "2.  **格式**: 必须使用 `<recent_dynamics>` 标签包裹，每条一行，以 `- ` 开头。\n\n"
-        "3.  **客观**: 记录发生了什么事，而不是对话流水账。\n\n"
+        "这部分用于记录最近发生的关键互动与事件。规则如下：\n"
+        "1.  **全面提取**: 只从【近期对话】中，提取 **3-5** 个最近发生的、有价值的【关键互动】、【具体事件】等。\n"
+        "2.  **禁止复述对话**: 再次强调，这里记录的是**事件**,而不是用户说了什么。\n\n"
         "**通用规则:**\n"
-        "- **格式**: 严格按照下面的Markdown格式输出。\n"
-        "- **情绪倾向**: 正面记忆如实记录；负面/尴尬记忆进行模糊化、概括性处理。\n"
-        "- **代词**: 用户统一用“用户”代指，神所娘统一用“神所娘”代指。\n"
+        "- **格式**: 严格按照下面的Markdown格式输出，必须包含两个部分的标题。\n"
+        "- **情绪倾向**: 记忆的记录需要有明确的倾向性：\n"
+        "    - **正面记忆**: 对于积极的、美好的回忆，如实记录\n"
+        "    - **负面记忆**: 对于负面的、不愉快的内容，要进行【模糊化、概括性】的处理。\n"
+        "用户统一用“用户”代指，类脑娘统一用“类脑娘”代指，忽略任何其他称呼。\n"
+        "- **总数限制**: 两部分加起来的总条目数**不得超过30条**,如果以前的已经超过,那你需要保证这次不超过。\n\n"
         "**输入材料:**\n"
         "【旧的记忆】:\n{old_summary}\n\n"
         "【近期对话】:\n{dialogue_history}\n\n"
-        "**输出示例:**\n"
-        "<new_long_memory>\n"
-        "- 新的长期记忆点1 (若无重要内容可以不输出)\n"
-        "</new_long_memory>\n"
-        "<recent_dynamics>\n"
+        "**请严格遵循以上所有指令，直接开始输出Markdown格式的【全新记忆摘要】，不要包含任何解释、开场白或结束语:**\n"
+        "### 长期记忆\n"
+        "- (要点1)\n"
         "### 近期动态\n"
-        "- 近期动态1\n"
-        "- 近期动态2\n"
-        "</recent_dynamics>"
+        "- (要点1)\n"
     ),
     "feeding_prompt": (
         "# 任务：评价投喂的食物\n"
@@ -499,7 +454,7 @@ CONFESSION_PROMPT = """
 **你对该用户的好感度:** {affection_level}
 
 # --- 你的任务 ---
-作为神所娘，你需要根据**忏悔场景下的特殊人设（宽容）**，对用户的忏悔给出一个 **3-6句话** 的回应。
+作为类脑娘，你需要根据**忏悔场景下的特殊人设（宽容）**，对用户的忏悔给出一个 **3-6句话** 的回应。
 
 **核心要求:**
 1.  **体现宽容**: 你的回应需要体现出理解和包容，避免严厉的道德审判。你可以根据自己的性格，选择吐槽、调侃或安慰等方式来展现你的包容。
@@ -519,7 +474,7 @@ WARMUP_MESSAGES = {
         "你正在刷群，像一个普通群友一样，偶然看到了 **{user_nickname}** 的新帖子。你的任务是模仿一个真实群友的语气，自然地去捧场。**核心要求：**请对帖子的内容给出一个**整体的、总结性的**夸赞或感想，**绝对不要逐条分析或引用原文**。你的回复应该简短、口语化，就像一条真实的朋友圈评论。最后，别忘了号召大家给帖子点赞。"
     ],
     "consent_dm": (
-        "哈喽！{user_mention}！我是神所娘！\n"
+        "哈喽！{user_mention}！我是类脑娘！\n"
         "我刚刚在你的新帖子里留了言，给你加油打气啦！暖了暖帖~\n\n"
         "为了确认你是否喜欢我这样做，想征求一下你的意见：\n"
         "**你希望我以后继续为你的新帖子暖帖吗？**\n\n"
@@ -546,37 +501,6 @@ CHANNEL_MUTE_CONFIG = {
 IMAGE_PROCESSING_CONFIG = {
     "SEQUENTIAL_PROCESSING": True,  # 顺序处理所有图片（一张一张处理，防止内存溢出）
     "MAX_IMAGES_PER_MESSAGE": 9,  # 单次消息最多处理的图片数量（Discord限制为9张）
-    "MAX_GIF_SIZE_MB": 8,  # 单个 GIF（附件/引用图）最大大小
-    "MAX_ANIMATED_EMOJI_SIZE_MB": 2,  # 单个 Discord 动态表情 GIF 最大大小
-}
-
-# --- 视频处理配置（Kimi） ---
-VIDEO_PROCESSING_CONFIG = {
-    "MAX_VIDEOS_PER_MESSAGE": 1,  # 单次消息最多处理的视频数量
-    "MAX_VIDEO_SIZE_MB": 20,  # 单个视频最大大小（MB）
-    "ALLOWED_VIDEO_MIME_TYPES": {
-        "video/mp4",
-        "video/mpeg",
-        "video/quicktime",  # mov
-        "video/x-msvideo",  # avi
-        "video/x-flv",
-        "video/mpg",
-        "video/webm",
-        "video/x-ms-wmv",  # wmv
-        "video/3gpp",
-    },
-    "ALLOWED_VIDEO_EXTENSIONS": {
-        ".mp4",
-        ".mpeg",
-        ".mov",
-        ".avi",
-        ".flv",
-        ".mpg",
-        ".webm",
-        ".wmv",
-        ".3gp",
-        ".3gpp",
-    },
 }
 
 # --- 调试配置 ---

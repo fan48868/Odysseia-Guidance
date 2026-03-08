@@ -37,7 +37,6 @@ from src.chat.features.chat_settings.services.chat_settings_service import (
 from src.chat.utils.image_utils import sanitize_image
 from src.database.services.token_usage_service import token_usage_service
 from src.database.database import AsyncSessionLocal
-from src.chat.services.openai_service import OpenAIService
 
 
 log = logging.getLogger(__name__)
@@ -68,79 +67,43 @@ if not invalid_key_logger.handlers:
 
 def _api_key_handler(func: Callable) -> Callable:
     """
-    双轨制装饰器：
-    1. generate_embedding -> 强制使用 GOOGLE_API_KEYS_LIST (官方直连)
-    2. 其他方法 (聊天) -> 优先使用 CUSTOM_GEMINI_URL (自定义通道)
+    一个装饰器，用于优雅地处理 API 密钥的获取、释放和重试逻辑。
+    实现了两层重试：
+    1. 外层循环：持续获取可用密钥，如果所有密钥都在冷却，则会等待。
+    2. 内层循环：对获取到的单个密钥，在遇到可重试错误时，会根据配置进行多次尝试。
     """
+
     @wraps(func)
     async def wrapper(self: "GeminiService", *args, **kwargs):
-        # [逻辑分流] 判断当前任务类型
-        is_embedding_task = func.__name__ == "generate_embedding"
+        # 检查是否配置了RAG API密钥
+        if self.key_rotation_service is None:
+            # 对于embedding方法，直接返回None
+            if func.__name__ == "generate_embedding":
+                log.warning("RAG功能未启用：未配置API密钥")
+                return None
+            # 对于其他方法，抛出异常让调用方处理
+            # 对话功能应该通过 _generate_with_custom_endpoint 处理
+            raise NoAvailableKeyError("未配置RAG API密钥，无法使用此方法")
 
-        # 一次性调试 URL（仅供本轮调用使用）
-        debug_base_url = kwargs.pop("debug_base_url", None)
-
-        # [逻辑分流] 决定是否使用自定义通道 (非向量化 且 配置了自定义参数)
-        use_custom_channel = (not is_embedding_task) and bool(self.custom_chat_key) and bool(
-            debug_base_url or self.custom_chat_url
-        )
-
-        # 定义一个简单的类来模拟 key_obj，用于自定义通道场景
-        class MockKeyObj:
-            def __init__(self, k): 
-                self.key = k
-                self.consecutive_failures = 0
-
+        # 正常流程：使用RAG API密钥
         while True:
             key_obj = None
-            client = None
-            
             try:
-                # --- [核心修改点] 根据通道类型创建不同的 Client ---
-                if use_custom_channel:
-                    # 【通道 A：聊天】走自定义中转（支持一次性调试 URL 覆盖）
-                    effective_custom_url = debug_base_url or self.custom_chat_url
-                    key_obj = MockKeyObj(self.custom_chat_key)
-                    http_options = types.HttpOptions(base_url=effective_custom_url)
-                    client = genai.Client(
-                        api_key=self.custom_chat_key, http_options=http_options
-                    )
-                    if debug_base_url:
-                        log.info(
-                            f"🧪 一次性调试已生效：{func.__name__} 临时改用 URL: {debug_base_url}"
-                        )
+                key_obj = await self.key_rotation_service.acquire_key()
+                client = self._create_client_with_key(key_obj.key)
 
-                else:
-                    # 【通道 B：向量】走官方直连 (或者是聊天回退)
-                    # 从轮换服务获取官方 Key
-                    key_obj = await self.key_rotation_service.acquire_key()
-                    if debug_base_url:
-                        http_options = types.HttpOptions(base_url=debug_base_url)
-                        client = genai.Client(api_key=key_obj.key, http_options=http_options)
-                        log.info(
-                            f"🧪 一次性调试已生效：{func.__name__} 临时改用官方通道 URL: {debug_base_url}"
-                        )
-                    else:
-                        # 强制直连 (不传 http_options，默认就是 google 官方)
-                        client = genai.Client(api_key=key_obj.key)
-                    # log.info(f"使用官方通道调用 {func.__name__}")
-
-                # --- 下面的逻辑保留原有的重试和错误处理框架 ---
-                
-                failure_penalty = 25
+                failure_penalty = 25  # 默认的失败惩罚
                 key_should_be_cooled_down = False
                 key_is_invalid = False
 
                 max_attempts = app_config.API_RETRY_CONFIG["MAX_ATTEMPTS_PER_KEY"]
-                # 如果是自定义通道，其实不需要循环尝试不同 Key，但为了复用代码结构，还是保留循环
                 for attempt in range(max_attempts):
                     try:
-                        # 只有官方通道才需要打印详细的 Key 轮换日志
-                        if not use_custom_channel:
-                            log.info(
-                                f"使用密钥 ...{key_obj.key[-4:]} (尝试 {attempt + 1}/{max_attempts}) 调用 {func.__name__}"
-                            )
+                        log.info(
+                            f"使用密钥 ...{key_obj.key[-4:]} (尝试 {attempt + 1}/{max_attempts}) 调用 {func.__name__}"
+                        )
 
+                        # 将 client 作为关键字参数传递给原始函数
                         kwargs["client"] = client
                         result = await func(self, *args, **kwargs)
 
@@ -159,78 +122,120 @@ def _api_key_handler(func: Callable) -> Callable:
 
                         if is_blocked_by_safety:
                             log.warning(
-                                f"安全策略拦截: {result.prompt_feedback.block_reason if result.prompt_feedback else '未知'}。"
+                                f"密钥 ...{key_obj.key[-4:]} 因安全策略被阻止 (原因: {result.prompt_feedback.block_reason if result.prompt_feedback else '未知'})。将进入冷却且不扣分。"
                             )
-                            failure_penalty = 0
+                            failure_penalty = 0  # 明确设置为0，不扣分
                             key_should_be_cooled_down = True
                             break
 
-                        # [重要] 只有官方 Key 才需要释放回池子
-                        if not use_custom_channel:
-                            await self.key_rotation_service.release_key(
-                                key_obj.key, success=True, safety_penalty=safety_penalty
-                            )
+                        await self.key_rotation_service.release_key(
+                            key_obj.key, success=True, safety_penalty=safety_penalty
+                        )
                         return result
 
-                    except (genai_errors.ClientError, genai_errors.ServerError) as e:
+                    except (
+                        genai_errors.ClientError,
+                        genai_errors.ServerError,
+                    ) as e:
                         error_str = str(e)
                         match = re.match(r"(\d{3})", error_str)
                         status_code = int(match.group(1)) if match else None
-                        
-                        # 简单的可重试判断
+
                         is_retryable = status_code in [429, 503]
-                        if isinstance(e, genai_errors.ServerError) and "503" in error_str:
-                             is_retryable = True
+                        if (
+                            not is_retryable
+                            and isinstance(e, genai_errors.ServerError)
+                            and "503" in error_str
+                        ):
+                            is_retryable = True
+                            status_code = 503
 
                         if is_retryable:
-                            log.warning(f"可重试错误 ({status_code})")
+                            log.warning(
+                                f"密钥 ...{key_obj.key[-4:]} 遇到可重试错误 (状态码: {status_code})。"
+                            )
                             if attempt < max_attempts - 1:
-                                await asyncio.sleep(1) # 简单等待
+                                delay = app_config.API_RETRY_CONFIG[
+                                    "RETRY_DELAY_SECONDS"
+                                ]
+                                log.info(f"等待 {delay} 秒后重试。")
+                                await asyncio.sleep(delay)
                             else:
+                                log.warning(
+                                    f"密钥 ...{key_obj.key[-4:]} 的所有 {max_attempts} 次重试均失败。将进入冷却。"
+                                )
+                                # --- 渐进式惩罚逻辑 ---
+                                base_penalty = 10
+                                consecutive_failures = (
+                                    key_obj.consecutive_failures + 1
+                                )  # +1 是因为本次失败也要计算在内
+                                failure_penalty = base_penalty * consecutive_failures
+                                log.warning(
+                                    f"密钥 ...{key_obj.key[-4:]} 已连续失败 {consecutive_failures} 次。"
+                                    f"本次惩罚分值: {failure_penalty}"
+                                )
                                 key_should_be_cooled_down = True
-                        
-                        elif status_code in [400, 403] and "API_KEY" in str(e).upper():
-                             log.error(f"密钥无效 ({status_code})")
-                             key_is_invalid = True # 标记为无效，触发外层循环换 Key (仅限官方)
-                             failure_penalty = 101
-                             key_should_be_cooled_down = True
-                             break
+
+                        elif status_code == 403 or (
+                            status_code == 400
+                            and "API_KEY_INVALID" in error_str.upper()
+                        ):
+                            log.error(
+                                f"密钥 ...{key_obj.key[-4:]} 无效 (状态码: {status_code})。将施加毁灭性惩罚。"
+                            )
+                            failure_penalty = 101  # 毁灭性惩罚
+                            key_should_be_cooled_down = True
+                            break  # 直接跳出重试循环
+
                         else:
-                            # 其他错误
-                            log.error(f"API调用发生错误: {e}", exc_info=True)
-                            # 如果是自定义通道报错，直接返回错误提示，不再尝试轮换
-                            if use_custom_channel:
-                                return "服务连接失败，请稍后再试。"
-                                
-                            await self.key_rotation_service.release_key(key_obj.key, success=True)
-                            if func.__name__ == "generate_embedding":
-                                return None
-                            return "呜哇，有点晕嘞，等我休息一会儿 <伤心>"
+                            log.error(
+                                f"使用密钥 ...{key_obj.key[-4:]} 时发生意外的致命API错误 (状态码: {status_code}): {e}",
+                                exc_info=True,
+                            )
+                            if isinstance(e, genai_errors.ServerError):
+                                # 对于服务器错误，也采用渐进式惩罚
+                                base_penalty = 15  # 服务器错误的基础惩罚可以稍高
+                                consecutive_failures = key_obj.consecutive_failures + 1
+                                failure_penalty = base_penalty * consecutive_failures
+                                log.warning(
+                                    f"密钥 ...{key_obj.key[-4:]} 遭遇服务器错误，已连续失败 {consecutive_failures} 次。"
+                                    f"本次惩罚分值: {failure_penalty}"
+                                )
+                                key_should_be_cooled_down = True
+                                break
+                            else:
+                                await self.key_rotation_service.release_key(
+                                    key_obj.key, success=True
+                                )
+                                return (
+                                    "抱歉，AI服务遇到了一个意料之外的错误，请稍后再试。"
+                                )
+
+                    except Exception as e:
+                        log.error(
+                            f"使用密钥 ...{key_obj.key[-4:]} 时发生未知错误: {e}",
+                            exc_info=True,
+                        )
+                        await self.key_rotation_service.release_key(
+                            key_obj.key, success=True
+                        )
+                        if func.__name__ == "generate_embedding":
+                            return None
+                        return "呜哇，有点晕嘞，等我休息一会儿 <伤心>"
 
                 if key_is_invalid:
-                    if use_custom_channel:
-                         return "配置的自定义 API Key 无效。"
-                    continue # 官方通道：换下一个 Key 重试
+                    continue
 
                 if key_should_be_cooled_down:
-                    if not use_custom_channel:
-                        await self.key_rotation_service.release_key(
-                            key_obj.key, success=False, failure_penalty=failure_penalty
-                        )
-                    else:
-                        # 自定义通道冷却：简单休眠一下
-                        await asyncio.sleep(2)
+                    await self.key_rotation_service.release_key(
+                        key_obj.key, success=False, failure_penalty=failure_penalty
+                    )
 
             except NoAvailableKeyError:
-                log.error("所有官方 API 密钥均不可用。")
-                if func.__name__ == "generate_embedding":
-                    return None
+                log.error(
+                    "所有API密钥均不可用，且 acquire_key 未能成功等待。这是异常情况。"
+                )
                 return "啊啊啊服务器要爆炸啦！现在有点忙不过来，你过一会儿再来找我玩吧！<生气>"
-            except Exception as outer_e:
-                log.error(f"严重未知错误: {outer_e}", exc_info=True)
-                if func.__name__ == "generate_embedding":
-                    return None
-                return "系统发生严重错误。"
 
     return wrapper
 
@@ -248,15 +253,6 @@ class GeminiService:
 
     def __init__(self):
         self.bot = None  # 用于存储 Discord Bot 实例
-        self.custom_chat_url = os.getenv("CUSTOM_GEMINI_URL")
-        self.custom_chat_key = os.getenv("CUSTOM_GEMINI_API_KEY")
-        if self.custom_chat_url and self.custom_chat_key:
-            log.info(f"✅ 已启用自定义聊天通道: {self.custom_chat_url}")
-        else:
-            log.info("ℹ️ 未检测到完整的自定义聊天配置，将回退到官方 API。")
-
-        # 一次性调试 URL（下一次发送生效一次后自动清空）
-        self._one_time_debug_base_url: Optional[str] = None
 
         # --- (新) SDK 底层调试日志 ---
         # 根据最新指南 (2025)，开启此选项可查看详细的 HTTP 请求/响应
@@ -313,12 +309,6 @@ class GeminiService:
             bot=self.bot, tool_map=self.tool_map, tool_declarations=self.available_tools
         )
 
-        # OpenAI 兼容通道服务（DeepSeek / Kimi）
-        self.openai_service = OpenAIService(
-            tool_service=self.tool_service,
-            post_process_response=self._post_process_response,
-        )
-
         log.info("--- 工具加载完成 (模块化) ---")
         log.info(
             f"已加载 {len(self.available_tools)} 个工具: {list(self.tool_map.keys())}"
@@ -333,19 +323,6 @@ class GeminiService:
         self.tool_service.bot = bot
         self.last_called_tools: List[str] = []
         log.info("Discord Bot 实例已成功注入 ToolService。")
-
-    def arm_one_time_debug_base_url(self, base_url: str) -> None:
-        """设置一次性调试 URL：仅下一次 generate_response 生效一次。"""
-        self._one_time_debug_base_url = base_url.rstrip("/")
-        log.info(f"🧪 已激活一次性调试 URL: {self._one_time_debug_base_url}")
-
-    def consume_one_time_debug_base_url(self) -> Optional[str]:
-        """消费一次性调试 URL，并立即清空。"""
-        current = self._one_time_debug_base_url
-        self._one_time_debug_base_url = None
-        if current:
-            log.info(f"🧪 已消费一次性调试 URL: {current}")
-        return current
 
     def _create_client_with_key(self, api_key: str):
         """使用给定的 API 密钥动态创建一个 Gemini 客户端实例。"""
@@ -447,7 +424,7 @@ class GeminiService:
         return {"role": content.role, "parts": serialized_parts}
 
     # --- Refactored generate_response and its helpers ---
-    def _prepare_api_contents(self, conversation: List[Dict]) -> List[types.Content]:
+    def _prepare_api_contents(self, conversation: List[Dict]) -> List:
         """将对话历史转换为 API 所需的 Content 对象列表。"""
         processed_contents = []
         for turn in conversation:
@@ -464,15 +441,10 @@ class GeminiService:
                     buffered = io.BytesIO()
                     part_item.save(buffered, format="PNG")
                     img_bytes = buffered.getvalue()
-                    try:
-                        img_bytes, mime_type = sanitize_image(img_bytes)
-                    except Exception as e:
-                        log.error(f"图片处理失败: {e}")
-                        mime_type = "image/png"
                     processed_parts.append(
                         types.Part(
                             inline_data=types.Blob(
-                                mime_type=mime_type, data=img_bytes
+                                mime_type="image/png", data=img_bytes
                             )
                         )
                     )
@@ -553,118 +525,132 @@ class GeminiService:
         location_name: str = "未知位置",
         model_name: Optional[str] = None,
         user_id_for_settings: Optional[str] = None,
-        videos: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         AI 回复生成的分发器。
-        如果选择了自定义模型，则优先尝试自定义端点；如果失败，则自动回退到官方 API。
+        如果选择了自定义模型，则优先尝试自定义端点；如果失败，则根据设置决定是否回退到官方 API。
         """
-        # 一次性调试 URL：在入口处消费，确保只生效 1 次
-        one_time_debug_base_url = self.consume_one_time_debug_base_url()
-        if one_time_debug_base_url:
-            log.info(
-                f"🧪 generate_response 已启用一次性调试 URL: {one_time_debug_base_url}，模型: {model_name or self.default_model_name}"
-            )
-
-        # --- OpenAI 兼容专用路由（DeepSeek / Kimi） ---
-        if model_name in ["deepseek-chat", "deepseek-reasoner", "kimi-k2.5", "custom"]:
-            log.info(f"检测到 {model_name} 模型，切换至 OpenAIService。")
-            result = await self.openai_service.generate_response(
-                user_id=user_id,
-                guild_id=guild_id,
-                message=message,
-                channel=channel,
-                replied_message=replied_message,
-                images=images,
-                user_name=user_name,
-                channel_context=channel_context,
-                world_book_entries=world_book_entries,
-                personal_summary=personal_summary,
-                affection_status=affection_status,
-                user_profile_data=user_profile_data,
-                guild_name=guild_name,
-                location_name=location_name,
-                model_name=model_name,
-                user_id_for_settings=user_id_for_settings,
-                override_base_url=one_time_debug_base_url,
-                videos=videos,
-            )
-            self.last_called_tools = list(self.openai_service.last_called_tools)
-            return result
-
         # 如果选择了自定义模型，则尝试使用它，并准备好回退
         if model_name and model_name in app_config.CUSTOM_GEMINI_ENDPOINTS:
             log.info(f"检测到自定义模型 '{model_name}'，将优先尝试使用自定义端点。")
-            max_attempts = 2  # 1次主尝试 + 1次重试
-            last_exception = None
-            for attempt in range(max_attempts):
-                try:
-                    log.info(
-                        f"尝试使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts})"
-                    )
-                    return await self._generate_with_custom_endpoint(
-                        user_id=user_id,
-                        guild_id=guild_id,
-                        message=message,
-                        channel=channel,
-                        replied_message=replied_message,
-                        images=images,
-                        user_name=user_name,
-                        channel_context=channel_context,
-                        world_book_entries=world_book_entries,
-                        personal_summary=personal_summary,
-                        affection_status=affection_status,
-                        user_profile_data=user_profile_data,
-                        guild_name=guild_name,
-                        location_name=location_name,
-                        model_name=model_name,
-                        user_id_for_settings=user_id_for_settings,
-                        override_base_url=one_time_debug_base_url,
-                    )
-                except Exception as e:
-                    last_exception = e
-                    log.warning(
-                        f"使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts}) 失败: {e}"
-                    )
-                    if attempt < max_attempts - 1:
-                        await asyncio.sleep(1)  # 在重试前稍作等待
 
-            # 如果所有尝试都失败了，则执行回退逻辑
-            # 检查是否配置了RAG API密钥
-            if self.key_rotation_service is None:
+            # 检查是否启用API fallback
+            api_fallback_enabled = await chat_settings_service.is_api_fallback_enabled(
+                guild_id
+            )
+            log.info(f"API fallback设置: {'开启' if api_fallback_enabled else '关闭'}")
+
+            if api_fallback_enabled:
+                # 开启fallback：当前逻辑 - 尝试2次，失败后回退到官方API
+                max_attempts = 2  # 1次主尝试 + 1次重试
+                last_exception = None
+                for attempt in range(max_attempts):
+                    try:
+                        log.info(
+                            f"尝试使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts})"
+                        )
+                        return await self._generate_with_custom_endpoint(
+                            user_id=user_id,
+                            guild_id=guild_id,
+                            message=message,
+                            channel=channel,
+                            replied_message=replied_message,
+                            images=images,
+                            user_name=user_name,
+                            channel_context=channel_context,
+                            world_book_entries=world_book_entries,
+                            personal_summary=personal_summary,
+                            affection_status=affection_status,
+                            user_profile_data=user_profile_data,
+                            guild_name=guild_name,
+                            location_name=location_name,
+                            model_name=model_name,
+                            user_id_for_settings=user_id_for_settings,
+                        )
+                    except Exception as e:
+                        last_exception = e
+                        log.warning(
+                            f"使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts}) 失败: {e}"
+                        )
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(1)  # 在重试前稍作等待
+
+                # 如果所有尝试都失败了，则执行回退逻辑
+                # 检查是否配置了RAG API密钥
+                if self.key_rotation_service is None:
+                    log.error(
+                        f"自定义端点 '{model_name}' 的所有 {max_attempts} 次尝试均失败。最终错误: {last_exception}. "
+                        f"未配置 GOOGLE_API_KEYS_LIST，无法回退到官方 API。"
+                    )
+                    return "呜哇，有点晕嘞，自定义端点连接失败了，还没有配置备用API密钥呢，等配置好了再来找我玩吧！"
+
+                log.warning(
+                    f"自定义端点 '{model_name}' 的所有 {max_attempts} 次尝试均失败。最终错误: {last_exception}. "
+                    f"将回退到官方 API。"
+                )
+                # --- [新逻辑] 回退时固定使用 gemini-2.5-flash 模型 ---
+                fallback_model_name = "gemini-2.5-flash"
+                log.info(f"回退到官方 API，固定使用模型 '{fallback_model_name}'。")
+
+                return await self._generate_with_official_api(
+                    user_id=user_id,
+                    guild_id=guild_id,
+                    message=message,
+                    channel=channel,
+                    replied_message=replied_message,
+                    images=images,
+                    user_name=user_name,
+                    channel_context=channel_context,
+                    world_book_entries=world_book_entries,
+                    personal_summary=personal_summary,
+                    affection_status=affection_status,
+                    user_profile_data=user_profile_data,
+                    guild_name=guild_name,
+                    location_name=location_name,
+                    model_name=fallback_model_name,  # 关键：使用固定的回退模型
+                    user_id_for_settings=user_id_for_settings,
+                )
+            else:
+                # 关闭fallback：重试自定义端点5次，失败后返回固定文本
+                max_attempts = 5
+                last_exception = None
+                for attempt in range(max_attempts):
+                    try:
+                        log.info(
+                            f"尝试使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts}, fallback已关闭)"
+                        )
+                        return await self._generate_with_custom_endpoint(
+                            user_id=user_id,
+                            guild_id=guild_id,
+                            message=message,
+                            channel=channel,
+                            replied_message=replied_message,
+                            images=images,
+                            user_name=user_name,
+                            channel_context=channel_context,
+                            world_book_entries=world_book_entries,
+                            personal_summary=personal_summary,
+                            affection_status=affection_status,
+                            user_profile_data=user_profile_data,
+                            guild_name=guild_name,
+                            location_name=location_name,
+                            model_name=model_name,
+                            user_id_for_settings=user_id_for_settings,
+                        )
+                    except Exception as e:
+                        last_exception = e
+                        log.warning(
+                            f"使用自定义端点 '{model_name}' (尝试 {attempt + 1}/{max_attempts}) 失败: {e}"
+                        )
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(1)  # 在重试前稍作等待
+
+                # 所有尝试都失败，返回固定文本
                 log.error(
                     f"自定义端点 '{model_name}' 的所有 {max_attempts} 次尝试均失败。最终错误: {last_exception}. "
-                    f"未配置 GOOGLE_API_KEYS_LIST，无法回退到官方 API。"
+                    f"API fallback已关闭，不进行回退。"
                 )
-                return "呜哇，有点晕嘞，自定义端点连接失败了，还没有配置备用API密钥呢，等配置好了再来找我玩吧！"
-
-            log.warning(
-                f"自定义端点 '{model_name}' 的所有 {max_attempts} 次尝试均失败。最终错误: {last_exception}. "
-                f"将回退到官方 API。"
-            )
-            # --- [新逻辑] 回退时固定使用 gemini-2.5-flash 模型 ---
-            fallback_model_name = "gemini-2.5-flash"
-            log.info(f"回退到官方 API，固定使用模型 '{fallback_model_name}'。")
-
-            return await self._generate_with_official_api(
-                user_id=user_id,
-                guild_id=guild_id,
-                message=message,
-                channel=channel,
-                replied_message=replied_message,
-                images=images,
-                user_name=user_name,
-                channel_context=channel_context,
-                world_book_entries=world_book_entries,
-                personal_summary=personal_summary,
-                affection_status=affection_status,
-                user_profile_data=user_profile_data,
-                guild_name=guild_name,
-                location_name=location_name,
-                model_name=fallback_model_name,  # 关键：使用固定的回退模型
-                user_id_for_settings=user_id_for_settings,
-                debug_base_url=one_time_debug_base_url,
-            )
+                return "呜哇，现在有点晕嘞"
 
         # 对于非自定义模型或回退失败后的默认路径
         # 检查是否配置了RAG API密钥
@@ -694,7 +680,6 @@ class GeminiService:
             location_name=location_name,
             model_name=model_name,
             user_id_for_settings=user_id_for_settings,
-            debug_base_url=one_time_debug_base_url,
         )
 
     async def _generate_with_custom_endpoint(
@@ -715,7 +700,6 @@ class GeminiService:
         location_name: str = "未知位置",
         model_name: Optional[str] = None,
         user_id_for_settings: Optional[str] = None,
-        override_base_url: Optional[str] = None,
     ) -> str:
         """
         [新增] 使用自定义端点 (例如公益站) 生成 AI 回复。
@@ -725,33 +709,23 @@ class GeminiService:
         if not model_name:
             raise ValueError("调用自定义端点时需要提供 model_name。")
         endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(model_name)
-        if not endpoint_config:
+        if not endpoint_config or not all(
+            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
+        ):
             error_msg = (
-                f"模型 '{model_name}' 的自定义端点配置未找到。"
-                "请检查 CUSTOM_GEMINI_ENDPOINTS 配置。"
-            )
-            log.error(error_msg)
-            raise ValueError(error_msg)
-
-        effective_base_url = override_base_url or endpoint_config.get("base_url")
-        effective_api_key = endpoint_config.get("api_key")
-        if not effective_base_url or not effective_api_key:
-            error_msg = (
-                f"模型 '{model_name}' 的自定义端点配置不完整。"
+                f"模型 '{model_name}' 的自定义端点配置不完整或未找到。"
                 "请检查 CUSTOM_GEMINI_URL_* 和 CUSTOM_GEMINI_API_KEY_* 环境变量。"
             )
             log.error(error_msg)
+            # 抛出异常以触发回退逻辑
             raise ValueError(error_msg)
 
         # --- 关键：为自定义端点单独创建客户端，不使用全局的 _create_client_with_key ---
-        if override_base_url:
-            log.info(
-                f"🧪 一次性调试已生效：自定义模型 '{model_name}' 临时改用 URL: {effective_base_url}"
-            )
-        else:
-            log.info(f"正在为自定义端点创建客户端: {effective_base_url}")
-        http_options = types.HttpOptions(base_url=effective_base_url)
-        client = genai.Client(api_key=effective_api_key, http_options=http_options)
+        log.info(f"正在为自定义端点创建客户端: {endpoint_config['base_url']}")
+        http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
+        client = genai.Client(
+            api_key=endpoint_config["api_key"], http_options=http_options
+        )
 
         # --- [重构] 针对自定义端点的图片净化 ---
         # 只有在调用自定义端点时才执行此操作，因为官方API可以处理这些图片。
@@ -924,22 +898,6 @@ class GeminiService:
         [新增] 核心的 AI 生成周期，包含上下文构建、工具调用循环和响应处理。
         此方法被 _generate_with_official_api 和 _generate_with_custom_endpoint 复用。
         """
-        # 自动 RAG 检索逻辑：如果调用方没传条目，且有用户消息，我们就自己去数据库搜！
-        if not world_book_entries and message:
-            try:
-                # 延迟导入，防止循环引用
-                from src.chat.features.world_book.database.world_book_db_manager import world_book_db_manager
-                
-                #拿着用户的消息去数据库里搜关键词
-                found_entries = await world_book_db_manager.search_entries_in_message(message)
-                
-                if found_entries:
-                    # 如果搜到了，就强制替换掉原本为空的 entries
-                    world_book_entries = found_entries
-                    titles = [e.get('title', '未知') for e in found_entries]
-                    log.info(f"📚 触发世界书/成员设定，已注入 Prompt: {titles}")
-            except Exception as e:
-                log.warning(f"世界书自动检索失败 (不影响正常对话): {e}")
         # --- 模型使用计数 ---
         # 使用 prompt_model_name (表面模型名) 进行计数，而不是 api_model_name (真实模型名)
         model_to_count = prompt_model_name or self.default_model_name
@@ -960,7 +918,6 @@ class GeminiService:
             location_name=location_name,
             model_name=prompt_model_name,
             channel=channel,  # 传递 channel 对象
-            user_id=user_id,
         )
 
         # 3. 准备 API 调用参数 (重构)
@@ -989,24 +946,8 @@ class GeminiService:
             user_id_for_settings=user_id_for_settings
         )
         if dynamic_tools:
-            disabled_in_gemini = {"analyze_image_with_gemini_pro", "get_balance"}
-            filtered_dynamic_tools = [
-                tool
-                for tool in dynamic_tools
-                if getattr(tool, "__name__", "") not in disabled_in_gemini
-            ]
-            enabled_tools.extend(filtered_dynamic_tools)
-            log.info(f"已根据上下文合并 {len(filtered_dynamic_tools)} 个动态函数工具。")
-
-            skipped_tools = [
-                getattr(tool, "__name__", "unknown")
-                for tool in dynamic_tools
-                if getattr(tool, "__name__", "") in disabled_in_gemini
-            ]
-            if skipped_tools:
-                log.info(
-                    f"Gemini 分支已跳过 {len(skipped_tools)} 个禁用工具（{', '.join(skipped_tools)}）。"
-                )
+            enabled_tools.extend(dynamic_tools)
+            log.info(f"已根据上下文合并 {len(dynamic_tools)} 个动态函数工具。")
 
         # 4. 如果最终有工具被启用，则配置到生成参数中
         if enabled_tools:
@@ -1115,36 +1056,7 @@ class GeminiService:
             if log_detailed:
                 log.info(f"准备执行 {len(function_calls)} 个工具调用...")
 
-            skipped_tool_parts = []
-            executable_calls = []
-
-            disabled_tool_calls_in_gemini = {
-                "analyze_image_with_gemini_pro",
-                "get_balance",
-            }
-
-            for call in function_calls:
-                if call.name in disabled_tool_calls_in_gemini:
-                    skipped_tool_parts.append(
-                        types.Part.from_function_response(
-                            name=call.name or "unknown_tool",
-                            response={
-                                "result": {
-                                    "error": f"当前 Gemini 分支已禁用工具 {call.name}。"
-                                }
-                            },
-                        )
-                    )
-                    if log_detailed:
-                        log.info(
-                            f"Gemini 分支拦截到禁用工具调用 {call.name}，已跳过执行。"
-                        )
-                    continue
-
-                executable_calls.append(call)
-
-            tool_result_parts = list(skipped_tool_parts)
-
+            tool_result_parts = []
             tasks = [
                 self.tool_service.execute_tool_call(
                     tool_call=call,
@@ -1153,11 +1065,9 @@ class GeminiService:
                     log_detailed=log_detailed,
                     user_id_for_settings=user_id_for_settings,
                 )
-                for call in executable_calls
+                for call in function_calls
             ]
-            results = (
-                await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
-            )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for result in results:
                 if isinstance(result, Exception):
@@ -1448,7 +1358,6 @@ class GeminiService:
             return response.text.strip()
         return None
 
-    @_api_key_handler
     async def generate_simple_response(
         self,
         prompt: str,
@@ -1458,62 +1367,98 @@ class GeminiService:
     ) -> Optional[str]:
         """
         一个用于单次、非对话式文本生成的方法，允许传入完整的生成配置和可选的模型名称。
-        非常适合用于如“礼物回应”、“投喂”等需要自定义生成参数的一次性任务。
+        非常适合用于如"礼物回应"、"投喂"等需要自定义生成参数的一次性任务。
+        默认使用自定义端点（gemini-2.5-flash-custom）。
 
         Args:
             prompt: 提供给模型的完整输入提示。
             generation_config: 一个包含生成参数的字典 (e.g., temperature, max_output_tokens).
             model_name: (可选) 指定要使用的模型。如果为 None，则使用默认的聊天模型。
+            client: (可选) 客户端实例。如果为 None 且不使用自定义端点，则使用装饰器提供的客户端。
 
         Returns:
             生成的文本字符串，如果失败则返回 None。
         """
-        if not client:
-            raise ValueError("装饰器未能提供客户端实例。")
+        # 确定要使用的模型名称
+        final_model_name = model_name or self.default_model_name
+
+        # 检查是否使用自定义端点
+        endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(final_model_name)
+        if endpoint_config and all(
+            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
+        ):
+            # 使用自定义端点
+            log.info(f"正在为自定义端点创建客户端: {endpoint_config['base_url']}")
+            http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
+            client = genai.Client(
+                api_key=endpoint_config["api_key"], http_options=http_options
+            )
+            # 使用配置中的实际模型名称
+            final_model_name = endpoint_config.get("model_name", final_model_name)
+        else:
+            # 使用原来的逻辑（需要装饰器提供的客户端）
+            if not client:
+                raise ValueError("不使用自定义端点时，装饰器未能提供客户端实例。")
 
         loop = asyncio.get_event_loop()
         gen_config = types.GenerateContentConfig(
             **generation_config, safety_settings=self.safety_settings
         )
-        final_model_name = model_name or self.default_model_name
 
-        response = await loop.run_in_executor(
-            self.executor,
-            lambda: client.models.generate_content(
-                model=final_model_name, contents=[prompt], config=gen_config
-            ),
-        )
-
-        if response.parts:
-            return response.text.strip()
-
-        log.warning(f"generate_simple_response 未能生成有效内容。API 响应: {response}")
-        if response.prompt_feedback and response.prompt_feedback.block_reason:
-            log.warning(
-                f"请求可能被安全策略阻止，原因: {response.prompt_feedback.block_reason}"
+        try:
+            response = await loop.run_in_executor(
+                self.executor,
+                lambda: client.models.generate_content(
+                    model=final_model_name, contents=[prompt], config=gen_config
+                ),
             )
 
-        return None
+            if response.parts:
+                return response.text.strip()
 
-    @_api_key_handler
+            log.warning(
+                f"generate_simple_response 未能生成有效内容。API 响应: {response}"
+            )
+            if response.prompt_feedback and response.prompt_feedback.block_reason:
+                log.warning(
+                    f"请求可能被安全策略阻止，原因: {response.prompt_feedback.block_reason}"
+                )
+
+            return None
+        except Exception as e:
+            log.error(f"generate_simple_response 调用失败: {e}")
+            return None
+
     async def generate_thread_praise(
-        self, conversation_history: List[Dict[str, Any]], client: Any = None
+        self, conversation_history: List[Dict[str, Any]]
     ) -> Optional[str]:
         """
         专用于生成帖子夸奖的方法。
         现在接收一个由 prompt_service 构建好的完整对话历史。
+        使用自定义端点（goldenglow）进行生成。
 
         Args:
             conversation_history: 完整的对话历史列表。
-            client: (由装饰器注入) Gemini 客户端。
 
         Returns:
             生成的夸奖文本，如果失败则返回 None。
         """
-        if not client:
-            raise ValueError("装饰器未能提供客户端实例。")
+        # 使用自定义端点配置
+        model_name = app_config.THREAD_PRAISE_MODEL
+        endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(model_name)
+        if not endpoint_config or not all(
+            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
+        ):
+            log.error(f"暖贴功能的自定义端点配置不完整: {model_name}")
+            return None
 
-        loop = asyncio.get_event_loop()
+        # 创建自定义端点客户端
+        http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
+        client = genai.Client(
+            api_key=endpoint_config["api_key"], http_options=http_options
+        )
+        log.info(f"暖贴功能使用自定义端点: {endpoint_config['base_url']}")
+
         # --- (新增) 为暖贴功能启用思考 ---
         praise_config = app_config.GEMINI_THREAD_PRAISE_CONFIG.copy()
         thinking_budget = praise_config.pop("thinking_budget", None)
@@ -1529,7 +1474,7 @@ class GeminiService:
             )
             log.info(f"已为暖贴功能启用思维链 (Thinking)，预算: {thinking_budget}。")
 
-        final_model_name = self.default_model_name
+        final_model_name = endpoint_config.get("model_name", self.default_model_name)
 
         final_contents = self._prepare_api_contents(conversation_history)
 
@@ -1548,11 +1493,8 @@ class GeminiService:
             )
             log.info("------------------------------------")
 
-        response = await loop.run_in_executor(
-            self.executor,
-            lambda: client.models.generate_content(
-                model=final_model_name, contents=final_contents, config=gen_config
-            ),
+        response = await client.aio.models.generate_content(
+            model=final_model_name, contents=final_contents, config=gen_config
         )
 
         if response.parts:
@@ -1563,7 +1505,7 @@ class GeminiService:
                 if hasattr(part, "thought") and part.thought:
                     # 这是思考过程，忽略它
                     pass
-                elif hasattr(part, "text"):
+                elif hasattr(part, "text") and part.text:
                     # 这是最终回复
                     final_text += part.text
             return final_text.strip()
@@ -1576,40 +1518,6 @@ class GeminiService:
 
         return None
 
-    async def summarize_for_rag(
-        self,
-        latest_query: str,
-        user_name: str,
-        conversation_history: Optional[List[Dict[str, Any]]] = None,
-    ) -> str:
-        """
-        根据用户的最新发言和可选的对话历史，生成一个用于RAG搜索的独立查询。
-
-        Args:
-            latest_query: 用户当前发送的最新消息。
-            user_name: 提问用户的名字。
-            conversation_history: (可选) 包含多轮对话的列表。
-
-        Returns:
-            一个精炼后的、适合向量检索的查询字符串。
-        """
-        if not latest_query:
-            log.info("RAG summarization called with no latest_query.")
-            return ""
-
-        prompt = prompt_service.build_rag_summary_prompt(
-            latest_query, user_name, conversation_history
-        )
-        summarized_query = await self.generate_text(
-            prompt, temperature=0.0, model_name=app_config.QUERY_REWRITING_MODEL
-        )
-
-        if not summarized_query:
-            log.info("RAG查询总结失败，将直接使用用户的原始查询。")
-            return latest_query.strip()
-
-        return summarized_query.strip().strip('"')
-
     async def clear_user_context(self, user_id: int, guild_id: int):
         """清除指定用户的对话上下文"""
         await chat_db_manager.clear_ai_conversation_context(user_id, guild_id)
@@ -1619,14 +1527,14 @@ class GeminiService:
         """检查AI服务是否可用"""
         return self.key_rotation_service is not None
 
-    @_api_key_handler
     async def generate_text_with_image(
-        self, prompt: str, image_bytes: bytes, mime_type: str, client: Any = None
+        self, prompt: str, image_bytes: bytes, mime_type: str
     ) -> Optional[str]:
         """
         一个用于简单图文生成的精简方法。
         不涉及对话历史或上下文，仅根据输入提示和图片生成文本。
-        非常适合用于如“投喂”等一次性功能。
+        非常适合用于如"投喂"等一次性功能。
+        使用自定义端点（goldenglow）进行生成。
 
         Args:
             prompt: 提供给模型的输入提示。
@@ -1636,8 +1544,21 @@ class GeminiService:
         Returns:
             生成的文本字符串，如果失败则返回 None。
         """
-        if not client:
-            raise ValueError("装饰器未能提供客户端实例。")
+        # 使用自定义端点配置
+        model_name = app_config.FEEDING_MODEL
+        endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(model_name)
+        if not endpoint_config or not all(
+            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
+        ):
+            log.error(f"投喂功能的自定义端点配置不完整: {model_name}")
+            return None
+
+        # 创建自定义端点客户端
+        http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
+        client = genai.Client(
+            api_key=endpoint_config["api_key"], http_options=http_options
+        )
+        log.info(f"投喂功能使用自定义端点: {endpoint_config['base_url']}")
 
         # --- 新增：处理 GIF 图片 ---
         if mime_type == "image/gif":
@@ -1660,12 +1581,6 @@ class GeminiService:
                 return "呜哇，我的眼睛跟不上啦！有点看花眼了"
         # --- GIF 处理结束 ---
 
-        # --- 新增：检查并压缩图片 ---
-        try:
-            image_bytes, mime_type = sanitize_image(image_bytes)
-        except Exception as e:
-            log.error(f"压缩图片时出错: {e}")
-
         request_contents = [
             prompt,
             types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_bytes)),
@@ -1674,11 +1589,13 @@ class GeminiService:
             **app_config.GEMINI_VISION_GEN_CONFIG, safety_settings=self.safety_settings
         )
 
+        final_model_name = endpoint_config.get("model_name", self.default_model_name)
+
         response = await client.aio.models.generate_content(
-            model=self.default_model_name, contents=request_contents, config=gen_config
+            model=final_model_name, contents=request_contents, config=gen_config
         )
 
-        if response.parts:
+        if response.parts and response.text:
             return response.text.strip()
         elif response.prompt_feedback and response.prompt_feedback.block_reason:
             log.warning(
@@ -1689,21 +1606,32 @@ class GeminiService:
         log.warning(f"未能为图文生成有效回复。Response: {response}")
         return "我好像没看懂这张图里是什么，可以换一张或者稍后再试试吗？"
 
-    @_api_key_handler
-    async def generate_confession_response(
-        self, prompt: str, client: Any = None
-    ) -> Optional[str]:
+    async def generate_confession_response(self, prompt: str) -> Optional[str]:
         """
         专用于生成忏悔回应的方法。
+        使用自定义端点（goldenglow）进行生成。
         """
-        if not client:
-            raise ValueError("装饰器未能提供客户端实例。")
+        # 使用自定义端点配置
+        model_name = app_config.CONFESSION_MODEL
+        endpoint_config = app_config.CUSTOM_GEMINI_ENDPOINTS.get(model_name)
+        if not endpoint_config or not all(
+            [endpoint_config.get("base_url"), endpoint_config.get("api_key")]
+        ):
+            log.error(f"忏悔功能的自定义端点配置不完整: {model_name}")
+            return None
+
+        # 创建自定义端点客户端
+        http_options = types.HttpOptions(base_url=endpoint_config["base_url"])
+        client = genai.Client(
+            api_key=endpoint_config["api_key"], http_options=http_options
+        )
+        log.info(f"忏悔功能使用自定义端点: {endpoint_config['base_url']}")
 
         gen_config = types.GenerateContentConfig(
             **app_config.GEMINI_CONFESSION_GEN_CONFIG,
             safety_settings=self.safety_settings,
         )
-        final_model_name = self.default_model_name
+        final_model_name = endpoint_config.get("model_name", self.default_model_name)
 
         if app_config.DEBUG_CONFIG["LOG_AI_FULL_CONTEXT"]:
             log.info("--- 忏悔功能 · 完整 AI 上下文 ---")
@@ -1714,7 +1642,7 @@ class GeminiService:
             model=final_model_name, contents=[prompt], config=gen_config
         )
 
-        if response.parts:
+        if response.parts and response.text:
             return response.text.strip()
 
         log.warning(

@@ -1,6 +1,6 @@
 from discord.ui import Button, Select
 from discord import SelectOption, Interaction
-from typing import List, Callable, Awaitable
+from typing import List, Coroutine, Callable
 
 class PaginatedSelect:
     """
@@ -9,7 +9,7 @@ class PaginatedSelect:
     """
     def __init__(self, placeholder: str, custom_id_prefix: str,
                  options: List[SelectOption],
-                 on_select_callback: Callable[[Interaction], Awaitable[None]],
+                 on_select_callback: Callable[[Interaction, List[str]], Coroutine],
                  label_prefix: str):
         self.placeholder = placeholder
         self.custom_id_prefix = custom_id_prefix

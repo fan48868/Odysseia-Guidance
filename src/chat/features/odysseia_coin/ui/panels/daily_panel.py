@@ -90,29 +90,23 @@ class DailyPanel(BasePanel):
 
             embed.add_field(name="今日特色", value=sell_body_stats_text, inline=False)
 
-            # --- 获取并显示今日赌场战绩 (21点 + 抽鬼牌) ---
-            blackjack_net = await chat_db_manager.get_blackjack_net_win_loss_today()
-            ghost_net = await chat_db_manager.get_ghost_card_net_win_loss_today()
-            
-            # 玩家视角的净盈亏 (正数=玩家赢, 负数=玩家输)
-            player_net_profit = blackjack_net + ghost_net
-            # 类脑娘视角的净盈亏 (相反数)
-            casino_profit = -player_net_profit
+            # --- 获取并显示今日21点战绩 ---
+            net_win_loss = await chat_db_manager.get_blackjack_net_win_loss_today()
 
-            if casino_profit > 1000:
+            if net_win_loss > 1000:
                 blackjack_comment = (
-                    f"今天赢麻了！从各位赌怪身上净赚 **{casino_profit}** 枚类脑币！"
+                    f"今天赢麻了！从各位赌怪身上净赚 **{net_win_loss}** 枚类脑币！"
                 )
-            elif casino_profit > 0:
+            elif net_win_loss > 0:
                 blackjack_comment = (
-                    f"今天运气不错，小赚了 **{casino_profit}** 枚类脑币。明天继续！"
+                    f"今天运气不错，小赚了 **{net_win_loss}** 枚类脑币。明天继续！"
                 )
-            elif casino_profit == 0:
+            elif net_win_loss == 0:
                 blackjack_comment = "今天赌场风平浪静，还没开张呢。"
-            elif casino_profit >= -1000:
-                blackjack_comment = f"可恶！今天竟然亏了 **{-casino_profit}** 枚类脑币！你们这些赌怪别太嚣张了！"
+            elif net_win_loss >= -1000:
+                blackjack_comment = f"可恶！今天竟然亏了 **{-net_win_loss}** 枚类脑币！你们这些赌怪别太嚣张了！"
             else:
-                blackjack_comment = f"今天要破产了呜呜呜...竟然被大家卷走了 **{-casino_profit}** 枚类脑币！"
+                blackjack_comment = f"今天要破产了呜呜呜...竟然被大家卷走了 **{-net_win_loss}** 枚类脑币！"
 
             embed.add_field(name="赌场风云", value=blackjack_comment, inline=False)
 

@@ -1,8 +1,5 @@
 import logging
 from typing import Optional
-import re
-import os
-import datetime
 from sqlalchemy.future import select
 from sqlalchemy import update
 from src.database.database import AsyncSessionLocal
@@ -73,7 +70,7 @@ class PersonalMemoryService:
                 CommunityMemberProfile.discord_id == str(user_id)
             )
             result = await session.execute(stmt)
-            old_summary = result.scalars().first() or ""
+            old_summary = result.scalars().first() or "无"
 
         dialogue_text = "\n".join(
             f"{'用户' if turn.get('role') == 'user' else 'AI'}: {' '.join(map(str, turn.get('parts', [])))}"
@@ -91,170 +88,48 @@ class PersonalMemoryService:
             return
 
         final_prompt = prompt_template.format(
-            old_summary=old_summary if old_summary else "无",
-            dialogue_history=dialogue_text,
+            old_summary=old_summary, dialogue_history=dialogue_text
         )
 
+        # --- [MEMORY DEBUGGER] ---
+        def count_summary_lines(summary: str) -> int:
+            return len(
+                [line for line in summary.split("\n") if line.strip().startswith("-")]
+            )
+
+        old_summary_lines = count_summary_lines(old_summary)
         log.info(f"---[MEMORY DEBUGGER]--- 用户 {user_id} 开始总结 ---")
+        log.info(f"旧摘要行数: {old_summary_lines}")
+        log.info(f"完整的旧摘要:\n{old_summary}")
+        log.info(f"用于总结的对话历史:\n{dialogue_text}")
+        # --- [MEMORY DEBUGGER] ---
 
-        max_retries = 3
-        ai_response = None
-        added_long_lines = []
-        new_recent_lines = []
-
-        # 仅对“AI 空响应”进行重试；超过条数限制时不重试，直接筛选
-        for attempt in range(max_retries):
-            ai_response = await gemini_service.generate_simple_response(
-                prompt=final_prompt,
-                generation_config=GEMINI_SUMMARY_GEN_CONFIG,
-                model_name=SUMMARY_MODEL,
-            )
-
-            if ai_response:
-                break
-
-            log.error(f"为用户 {user_id} 生成记忆摘要失败，AI 返回空 (尝试 {attempt + 1}/{max_retries})。")
-
-        if not ai_response:
-            log.error(f"为用户 {user_id} 生成记忆摘要失败，重试多次后仍无有效响应。")
-            return
-
-        # 4. 解析 AI 响应并合并记忆
-        # 提取新增的长期记忆
-        new_long_match = re.search(
-            r"<new_long_memory>(.*?)</new_long_memory>", ai_response, re.DOTALL
+        new_summary = await gemini_service.generate_simple_response(
+            prompt=final_prompt,
+            generation_config=GEMINI_SUMMARY_GEN_CONFIG,
+            model_name=SUMMARY_MODEL,
         )
-        if new_long_match:
-            content = new_long_match.group(1).strip()
-            if content:
-                added_long_lines = [
-                    line.strip()
-                    for line in content.split("\n")
-                    if line.strip().startswith("-")
-                ]
 
-        # 检测条数限制：超过 2 条时，直接请求 AI 筛选，不再重试重新生成
-        if len(added_long_lines) > 2:
-            log.warning(
-                f"生成的长期记忆条数 ({len(added_long_lines)}) 超过限制 (2条)，直接请求 AI 筛选最重要的 2 条。"
-            )
-
-            # 构建筛选 Prompt
-            memory_items = [line.lstrip("- ").strip() for line in added_long_lines]
-            memory_list_text = "\n".join([f"{i + 1}. {item}" for i, item in enumerate(memory_items)])
-
-            selection_prompt = (
-                f"你为用户生成了以下 {len(memory_items)} 条长期记忆，但这超过了系统限制（最多保留 2 条）。\n"
-                "请仔细评估，从中筛选出 **最重要、最具深层价值** 的 2 条记忆。\n\n"
-                "**待筛选列表:**\n"
-                f"{memory_list_text}\n\n"
-                "**输出要求:**\n"
-                "1. 只输出筛选后的 2 条内容。\n"
-                "2. 保持原意，不要修改内容。\n"
-                "3. 每条一行，严格以 `- ` 开头。\n"
-                "4. 不要输出任何其他解释性文字。"
-            )
-
-            try:
-                selection_response = await gemini_service.generate_simple_response(
-                    prompt=selection_prompt,
-                    generation_config=GEMINI_SUMMARY_GEN_CONFIG,
-                    model_name=SUMMARY_MODEL,
+        # 4. 将新摘要保存到数据库
+        if new_summary:
+            # --- [MEMORY DEBUGGER] ---
+            new_summary_lines = count_summary_lines(new_summary)
+            log.info(f"---[MEMORY DEBUGGER]--- 用户 {user_id} 总结完毕 ---")
+            log.info(f"新摘要行数: {new_summary_lines} (Prompt要求 <= 30)")
+            if new_summary_lines > 30:
+                log.error("!!!!!!!! MEMORY EXPLOSION DETECTED !!!!!!!!")
+                log.error(
+                    f"用户 {user_id} 的新摘要行数 ({new_summary_lines}) 超过了30条的硬性限制！"
                 )
-
-                if selection_response:
-                    selected_lines = [
-                        line.strip()
-                        for line in selection_response.split("\n")
-                        if line.strip().startswith("-")
-                    ]
-                    if selected_lines:
-                        log.info(f"AI 筛选成功，保留了 {len(selected_lines)} 条记忆。")
-                        added_long_lines = selected_lines[:2]
-                    else:
-                        log.warning("AI 筛选响应格式不符合预期，回退到强制截断。")
-                        added_long_lines = added_long_lines[:2]
-                else:
-                    log.warning("AI 筛选响应为空，回退到强制截断。")
-                    added_long_lines = added_long_lines[:2]
-            except Exception as e:
-                log.error(f"AI 筛选过程发生错误: {e}，回退到强制截断。")
-                added_long_lines = added_long_lines[:2]
-
-        # 提取新的近期动态
-        new_recent_match = re.search(
-            r"<recent_dynamics>(.*?)</recent_dynamics>", ai_response, re.DOTALL
-        )
-        if new_recent_match:
-            content = new_recent_match.group(1).strip()
-            if content:
-                new_recent_lines = [
-                    line.strip()
-                    for line in content.split("\n")
-                    if line.strip().startswith("-")
-                ]
-
-        # --- 日志记录逻辑 ---
-        log_dir = PERSONAL_MEMORY_CONFIG.get("log_dir")
-        if log_dir and (added_long_lines or new_recent_lines):
-            try:
-                if not os.path.exists(log_dir):
-                    os.makedirs(log_dir)
-                
-                today_str = datetime.date.today().strftime("%Y-%m-%d")
-                log_file_path = os.path.join(log_dir, f"memory_summary_{today_str}.log")
-                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                with open(log_file_path, "a", encoding="utf-8") as f:
-                    f.write(f"[{current_time}] User ID: {user_id}\n")
-                    if added_long_lines:
-                        f.write("【新增长期记忆】:\n" + "\n".join(added_long_lines) + "\n")
-                    if new_recent_lines:
-                        f.write("【近期动态】:\n" + "\n".join(new_recent_lines) + "\n")
-                    f.write("-" * 50 + "\n")
-            except Exception as e:
-                log.error(f"写入记忆日志失败: {e}")
-
-        # 解析旧摘要以获取现有的长期记忆
-        old_long_lines = []
-        if old_summary:
-            lines = old_summary.split("\n")
-            in_long_section = False
-            for line in lines:
-                line = line.strip()
-                if line == "### 长期记忆":
-                    in_long_section = True
-                    continue
-                elif line == "### 近期动态":
-                    in_long_section = False
-                    continue
-
-                if in_long_section and line.startswith("-"):
-                    old_long_lines.append(line)
-
-        # 合并：旧长期 + 新增长期
-        final_long_lines = old_long_lines + added_long_lines
-
-        # 构建最终摘要字符串
-        final_summary = (
-            "### 长期记忆\n"
-            + "\n".join(final_long_lines)
-            + "\n\n### 近期动态\n"
-            + "\n".join(new_recent_lines)
-        )
-
-        print(
-            f"[MEMORY DEBUGGER] 用户 {user_id} 新增长期记忆:\n"
-            + ("\n".join(added_long_lines) if added_long_lines else "无")
-        )
-
-        log.info(f"---[MEMORY DEBUGGER]--- 用户 {user_id} 总结完毕 ---")
-        log.info(
-            f"新增长期记忆: {len(added_long_lines)} 条, 总长期记忆: {len(final_long_lines)} 条"
-        )
-        log.debug(f"完整的新摘要:\n{final_summary}")
-
-        await self.update_summary_manually(user_id, final_summary)
+                log.error(
+                    f"完整的失控摘要:\n{new_summary}"
+                )  # 使用 ERROR 级别记录失控的摘要
+            else:
+                log.debug(f"完整的新摘要:\n{new_summary}")
+            # --- [MEMORY DEBUGGER] ---
+            await self.update_summary_manually(user_id, new_summary)
+        else:
+            log.error(f"为用户 {user_id} 生成记忆摘要失败，AI 返回空。")
         log.info(f"用户 {user_id} 的总结流程完成。")
 
     async def get_memory_summary(self, user_id: int) -> str:
@@ -282,12 +157,6 @@ class PersonalMemoryService:
             async with session.begin():
                 await self._update_summary(session, user_id, new_summary)
         log.info(f"为用户 {user_id} 手动更新了记忆摘要。")
-
-    async def update_memory_summary(self, user_id: int, new_summary: str):
-        """
-        更新用户的个人记忆摘要 (用于命令调用)。
-        """
-        await self.update_summary_manually(user_id, new_summary)
 
     async def _update_summary(self, session, user_id: int, new_summary: Optional[str]):
         """私有方法：只更新摘要。"""
@@ -350,15 +219,6 @@ class PersonalMemoryService:
             async with session.begin():
                 await self._reset_history_and_count(session, user_id)
         log.info(f"用户 {user_id} 的对话历史已删除。")
-
-    def set_summary_threshold(self, threshold: int):
-        """运行时更新记忆总结阈值"""
-        PERSONAL_MEMORY_CONFIG["summary_threshold"] = threshold
-        log.info(f"个人记忆总结阈值已运行时更新为: {threshold}")
-
-    def get_summary_threshold(self) -> int:
-        """获取当前记忆总结阈值"""
-        return PERSONAL_MEMORY_CONFIG.get("summary_threshold", 20)
 
 
 # 单例实例

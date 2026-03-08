@@ -97,7 +97,7 @@ class WorldBookService:
                 knowledge_search_service,
             )
 
-            search_results = await knowledge_search_service.search(summarized_query, user_id=user_id)
+            search_results = await knowledge_search_service.search(summarized_query)
 
             if search_results:
                 search_brief = [

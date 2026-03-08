@@ -21,7 +21,6 @@ alembic
 # Data Processing & AI
 langchain-text-splitters
 numpy==1.26.4
-edge-tts
 
 # Web UI 依赖
 fastapi
