@@ -172,7 +172,7 @@ class ThreadCommentorService:
                     "parts": [PROMPT_CONFIG["default"]["JAILBREAK_MODEL_RESPONSE"]],
                 },
                 {"role": "user", "parts": [core_persona]},
-                {"role": "model", "parts": ["好的，我是类脑娘，已经准备好了"]},
+                {"role": "model", "parts": ["好的，我是神所娘，已经准备好了"]},
                 {"role": "user", "parts": [user_memory]},
                 {"role": "model", "parts": ["关于你的事情，我当然都记得"]},
             ]

@@ -51,6 +51,6 @@
   prompt: "亲密"
 - id: "very_friendly"
   min_affection: 100
-  max_affection: 99999
+  max_affection: 10000
   level_name: "信赖"
   prompt: "信赖"

@@ -303,3 +303,4 @@ src/chat/features/games/blackjack-web/vite.config.ts
 /pgdata/
 # Ignore tutorial source files, as they are processed into the database
 tutorial/
+测试.py

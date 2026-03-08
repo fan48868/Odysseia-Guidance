@@ -64,7 +64,7 @@ class TutorialSearchService:
             WITH semantic_search AS (
                 SELECT
                     kc.id,
-                    RANK() OVER (ORDER BY kc.embedding <=> :query_vector) as rank,
+                    ROW_NUMBER() OVER (ORDER BY kc.embedding <=> :query_vector) as rank,
                     td.thread_id
                 FROM tutorials.knowledge_chunks kc
                 JOIN tutorials.tutorial_documents td ON kc.document_id = td.id

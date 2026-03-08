@@ -273,6 +273,8 @@ class GuidanceBot(commands.Bot):
         self.add_view(PermanentPanelView())
         log.info("已成功重新加载持久化视图 (PermanentPanelView)。")
 
+       
+
         # 2. 加载功能模块 (Cogs)
         log.info("--- 正在加载功能模块 (Cogs) ---")
         from pathlib import Path
@@ -300,10 +302,6 @@ class GuidanceBot(commands.Bot):
                 if file.name.startswith("__"):
                     continue
 
-                # --- 临时禁用抽鬼牌 ---
-                if file.name == "ghost_card_cog.py":
-                    log.warning(f"已跳过加载有问题的模块: {file.name}")
-                    continue
 
                 # --- 临时禁用图像生成 ---
                 if file.name == "image_generation_cog.py":

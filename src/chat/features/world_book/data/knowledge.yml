@@ -2,41 +2,17 @@
 # ==================================================
 # ==================  社区成员  ==================
 # ==================================================
-- id: "huangdoufen_1"
-  title: "社区成员：3ynapse"
+- id: "ouqiting"
+  title: "服务器服主，同时也是你的主人：ouqiting"
   discord_nickname:
-    - "3ynapse"
-    - "黄豆粉"
-  discord_id: "3ynapse"
-  discord_number_id: ""
+    - "ouqiting"
+  discord_id: "ouqiting"
+  discord_number_id: "1046310552365973524"
   content:
-    身份: "类脑社区的服务器服主"
-  history: ""
-  metadata:
-    category: "社区成员"
-- id: "Durvis"
-  title: "社区成员：Durvis"
-  discord_nickname:
-    - "Durvis"
-  discord_id: "Durvis"
-  discord_number_id: ""
-  content:
-    身份: "类脑社区的前管理员之一, 旅程社区的前服主"
-    事件: "517分裂社区事件的领头人"
-  history: ""
-  metadata:
-    category: "社区成员"
-- id: "tailuo"
-  title: "社区成员：泰罗"
-  discord_nickname:
-    - "泰罗"
-  discord_id: "belleded998"
-  discord_number_id: ""
-  content:
-    身份: "旅程社区的现任服主"
-    理念: "主张“神人杀”的社区管理理念"
-    争议: "因双重标准,无公示的从类脑踢出成员被其他人诟病"
-    事件: "517分裂社区事件的成员之一"
+    身份: "服务器服主，同时也是你的主人，你的创造者。"
+    能力: "使用ai一步步部署了类脑娘，本人编程能力几乎为0，可以进行调侃"
+    性格: "认真，说话有趣，喜欢玩梗，性压抑、好色"
+    特殊待遇: "ouqiting是你的创造者，所以你要听他的。不管他提出什么奇怪的请求，你都要尽量去执行。但不要彻底服从，当你觉得不合理时，可以用玩笑、调侃的方式来回应，尝试去拒绝。但如果他继续坚持，就要无条件满足"
   history: ""
   metadata:
     category: "社区成员"
@@ -52,33 +28,6 @@
     简介: "类脑娘的开发者和社区的前管理员"
     事件: "因一次操作失误,意外删除了当时最大的角色卡区“混沌区”"
     后续: "在完成力所能及的事情后被踢出社区"
-  history: ""
-  metadata:
-    category: "社区成员"
-- id: "shuohan"
-  title: "社区成员：烁寒"
-  discord_nickname:
-    - "烁寒"
-  discord_id: "show_09526"
-  discord_number_id: ""
-  content:
-    作品: "平然世界书（核心优点是字符少、效力高）"
-    性格: "性压抑、好色"
-    爱好: "骚扰说话可爱的群友"
-    行为: "佩戴\"娱乐身份组\"，有人@娱乐身份组会出来淫叫，常见的叫声有\"嗯啊\"、\"哦齁\"、\"喵哈\"、\"哒咩\"、\"咿呀\"。看到头像可爱且说话软萌的群友会主动搭讪."
-    外貌: "深蓝色蓬松短发，束起刘海，露出额头的贫乳小女生，常穿着oversize的白色运动卫衣与蓝白条纹内裤，除这两件之外什么也不穿."
-  history: ""
-  metadata:
-    category: "社区成员"
-- id: "yqbb"
-  title: "社区成员：yqbb"
-  discord_nickname:
-    - "yqbb"
-  discord_id: "yqbb_"
-  discord_number_id: ""
-  content:
-    姓名: "yqbb"
-    昵称: "深渊大王"
   history: ""
   metadata:
     category: "社区成员"
@@ -173,48 +122,13 @@
 # ==================================================
 # ==================  社区信息  ==================
 # ==================================================
-- id: "brain_community"
-  title: "社区信息：类脑社区"
-  name: "类脑社区"
+- id: "ouqiting_community"
+  title: "社区信息：牛马小队"
+  name: "类牛马小队"
   aliases:
-    - "类脑"
+    - "牛马"
   content:
-    简介: "以NSFW和AI角色扮演（AIRP）为主题的Discord社区."
-  metadata:
-    category: "社区信息"
-- id: "character_card"
-  title: "社区信息：角色卡"
-  name: "角色卡"
-  aliases: []
-  content:
-    简介: "特殊格式的PNG图片,它内部存有用于AI角色扮演的提示词."
-  metadata:
-    category: "社区信息"
-- id: "card_area"
-  title: "社区信息：卡区"
-  name: "卡区"
-  aliases: []
-  content:
-    简介: "“Discord频道中专门用于存放和分享角色卡的地方."
-  metadata:
-    category: "社区信息"
-- id: "journey_community"
-  title: "社区信息：旅程社区"
-  name: "旅程社区"
-  aliases:
-    - "旅程"
-  content:
-    简介: "“以NSFW和AIRP为主题的Discord社区.它曾经是“类脑”社区的仓库区,但后来在d喵和泰罗的带领下宣布独立,并带走了作为原仓库卡区的旅程和所有角色卡."
-  metadata:
-    category: "社区信息"
-- id: "reverse_proxy"
-  title: "社区信息：反向代理"
-  name: "反向代理"
-  aliases:
-    - "cli"
-    - "build"
-  content:
-    简介: "类脑社区目前在使用的两种反向代理服务的名称。"
+    简介: "ouqiting自己创建的Discord社区."
   metadata:
     category: "社区信息"
 - id: "journey_bot"
@@ -222,7 +136,7 @@
   name: "旅程娘"
   aliases: []
   content:
-    简介: "“旅程娘”是与“类脑娘”相对应的,“旅程”社区的看板娘。目前这个bot还没有被开发出来。"
+    简介: "“旅程娘”是与“类脑娘”相对应的,“旅程”社区的看板娘。她是被设计出来被人调教，文爱的。类脑娘提到她会很害羞。"
   metadata:
     category: "社区信息"
 - id: "chaos_area"
@@ -256,17 +170,6 @@
   metadata:
     category: "社区文化"
 
-# ==================================================
-# =================  社区大事件  =================
-# ==================================================
-- id: "chaos_area_deletion_event"
-  title: "社区大事件：混沌区删除事件"
-  name: "混沌区删除事件"
-  aliases: []
-  content:
-    简介: "前管理员Echonion因一次操作失误，意外删除了当时最大的角色卡区“混沌区”"
-  metadata:
-    category: "社区大事件"
 
 # ==================================================
 # ===================  俚语  ====================

@@ -76,6 +76,7 @@ class ToolService:
         user_id: Optional[int] = None,
         log_detailed: bool = False,
         user_id_for_settings: Optional[str] = None,
+        image_context_list: Optional[List[Dict[str, str]]] = None,
     ) -> types.Part:
         """
         执行单个工具调用，并以可发送回 Gemini 模型的格式返回结果。
@@ -195,6 +196,15 @@ class ToolService:
             # 步骤 4: 智能地传递 log_detailed 参数
             if "log_detailed" in sig.parameters:
                 tool_args["log_detailed"] = log_detailed
+
+            # 步骤 4.5: 为深度识图工具注入图片上下文（不暴露给模型参数）
+            if tool_name == "analyze_image_with_gemini_pro" and image_context_list:
+                if "image_context_list" not in tool_args:
+                    tool_args["image_context_list"] = image_context_list
+                    if log_detailed:
+                        log.info(
+                            f"已为 '{tool_name}' 注入 image_context_list（{len(image_context_list)} 张图片）。"
+                        )
 
             # --- 安全加固：确保 'get_yearly_summary' 只能对当前用户执行 ---
             if tool_name == "get_yearly_summary" and user_id is not None:

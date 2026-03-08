@@ -276,6 +276,9 @@ class CategorySelect(ShopSelect["SimpleShopView"]):
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if view is None:
+            await interaction.response.send_message(
+                "商店界面已失效，请重新打开商店。", ephemeral=True
+            )
             return
 
         selected_category = self.values[0]
@@ -327,6 +330,9 @@ class BackToCategoriesButton(ShopButton["SimpleShopView"]):
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if view is None:
+            await interaction.response.send_message(
+                "商店界面已失效，请重新打开商店。", ephemeral=True
+            )
             return
 
         view.clear_items()

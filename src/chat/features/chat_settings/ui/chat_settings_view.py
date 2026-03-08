@@ -22,6 +22,13 @@ from src.chat.services.event_service import event_service
 from src.chat.features.chat_settings.ui.ai_model_settings_modal import (
     AIModelSettingsModal,
 )
+from src.chat.features.personal_memory.services.personal_memory_service import (
+    personal_memory_service,
+)
+from src.chat.features.chat_settings.ui.memory_settings_modal import (
+    MemorySettingsModal,
+)
+from src.chat.services.gemini_service import gemini_service
 
 
 class ChatSettingsView(View):
@@ -39,6 +46,8 @@ class ChatSettingsView(View):
         self.factions: Optional[List[Dict[str, Any]]] = None
         self.selected_faction: Optional[str] = None
         self.token_usage: Optional[TokenUsage] = None
+        self.reaction_enabled: bool = True
+        self.dm_enabled: bool = True
 
     async def _initialize(self):
         """异步获取设置并构建UI。"""
@@ -52,6 +61,17 @@ class ChatSettingsView(View):
             )
         self.factions = event_service.get_event_factions()
         self.selected_faction = event_service.get_selected_faction()
+
+        # 读取“表情反应”全局开关（按 guild 维度存储在 global_settings）
+        reaction_key = f"reaction_enabled:{self.guild.id}"
+        reaction_raw = await self.service.db_manager.get_global_setting(reaction_key)
+        self.reaction_enabled = (
+            reaction_raw.lower() == "true" if reaction_raw is not None else True
+        )
+
+        dm_raw = await self.service.db_manager.get_global_setting("global_dm_enabled")
+        self.dm_enabled = dm_raw.lower() == "true" if dm_raw is not None else True
+
         self._create_paginators()
         self._create_view_items()
 
@@ -117,34 +137,21 @@ class ChatSettingsView(View):
             )
         )
 
-        warm_up_enabled = self.settings.get("global", {}).get("warm_up_enabled", True)
         self.add_item(
             Button(
-                label=f"暖贴功能: {'开' if warm_up_enabled else '关'}",
-                style=ButtonStyle.green if warm_up_enabled else ButtonStyle.red,
-                custom_id="warm_up_toggle",
-                row=0,
-            )
-        )
-
-        api_fallback_enabled = self.settings.get("global", {}).get(
-            "api_fallback_enabled", True
-        )
-        self.add_item(
-            Button(
-                label=f"API回退: {'开' if api_fallback_enabled else '关'}",
-                style=ButtonStyle.green if api_fallback_enabled else ButtonStyle.red,
-                custom_id="api_fallback_toggle",
+                label=f"表情反应: {'开' if self.reaction_enabled else '关'}",
+                style=ButtonStyle.green if self.reaction_enabled else ButtonStyle.red,
+                custom_id="reaction_toggle",
                 row=0,
             )
         )
 
         self.add_item(
             Button(
-                label="设置暖贴频道",
-                style=ButtonStyle.secondary,
-                custom_id="warm_up_settings",
-                row=4,
+                label=f"私信开关: {'开' if self.dm_enabled else '关'}",
+                style=ButtonStyle.green if self.dm_enabled else ButtonStyle.red,
+                custom_id="global_dm_toggle",
+                row=0,
             )
         )
 
@@ -194,22 +201,39 @@ class ChatSettingsView(View):
             faction_select.callback = self.on_faction_select
             self.add_item(faction_select)
 
-        # 分类选择器 (第 2 行)
-        if self.category_paginator:
-            self.add_item(self.category_paginator.create_select(row=2))
-
-        # 频道选择器 (第 3 行)
-        if self.channel_paginator:
-            self.add_item(self.channel_paginator.create_select(row=3))
-
-        # 分页器按钮暂时不显示，因为UI空间不足
-        # TODO: 未来可以考虑重新设计UI布局以支持分页按钮
-        # if self.category_paginator:
-        #     for btn in self.category_paginator.get_buttons(row=4):
-        #         self.add_item(btn)
-        # if self.channel_paginator:
-        #     for btn in self.channel_paginator.get_buttons(row=4):
-        #         self.add_item(btn)
+        # 更换AI模型按钮
+        self.add_item(
+            Button(
+                label="更换AI模型",
+                style=ButtonStyle.secondary,
+                custom_id="ai_model_settings",
+                row=0,
+            )
+        )
+        self.add_item(
+            Button(
+                label="记忆总结频率",
+                style=ButtonStyle.secondary,
+                custom_id="memory_settings",
+                row=4,
+            )
+        )
+        self.add_item(
+            Button(
+                label="今日 Token 统计",
+                style=ButtonStyle.secondary,
+                custom_id="show_token_usage",
+                row=4,
+            )
+        )
+        self.add_item(
+            Button(
+                label="临时调试",
+                style=ButtonStyle.secondary,
+                custom_id="temp_debug_once",
+                row=4,
+            )
+        )
 
     async def _update_view(self, interaction: Interaction):
         """通过编辑附加的消息来刷新视图。"""
@@ -221,10 +245,12 @@ class ChatSettingsView(View):
 
         if custom_id == "global_chat_toggle":
             await self.on_global_toggle(interaction)
+        elif custom_id == "reaction_toggle":
+            await self.on_reaction_toggle(interaction)
         elif custom_id == "warm_up_toggle":
             await self.on_warm_up_toggle(interaction)
-        elif custom_id == "api_fallback_toggle":
-            await self.on_api_fallback_toggle(interaction)
+        elif custom_id == "global_dm_toggle":
+            await self.on_global_dm_toggle(interaction)
         elif custom_id == "warm_up_settings":
             await self.on_warm_up_settings(interaction)
         elif (
@@ -243,6 +269,10 @@ class ChatSettingsView(View):
             await self.on_ai_model_settings(interaction)
         elif custom_id == "show_token_usage":
             await self.on_show_token_usage(interaction)
+        elif custom_id == "temp_debug_once":
+            await self.on_temp_debug_once(interaction)
+        elif custom_id == "memory_settings":
+            await self.on_memory_settings(interaction)
 
         return True
 
@@ -256,6 +286,16 @@ class ChatSettingsView(View):
         )
         await self._update_view(interaction)
 
+    async def on_reaction_toggle(self, interaction: Interaction):
+        if not self.guild:
+            return
+        new_state = not self.reaction_enabled
+        reaction_key = f"reaction_enabled:{self.guild.id}"
+        await self.service.db_manager.set_global_setting(
+            reaction_key, "true" if new_state else "false"
+        )
+        await self._update_view(interaction)
+
     async def on_warm_up_toggle(self, interaction: Interaction):
         current_state = self.settings.get("global", {}).get("warm_up_enabled", True)
         new_state = not current_state
@@ -266,15 +306,10 @@ class ChatSettingsView(View):
         )
         await self._update_view(interaction)
 
-    async def on_api_fallback_toggle(self, interaction: Interaction):
-        """切换 API fallback 全局设置。"""
-        current_state = self.settings.get("global", {}).get(
-            "api_fallback_enabled", True
-        )
-        new_state = not current_state
-        # 更新全局设置
+    async def on_global_dm_toggle(self, interaction: Interaction):
+        new_state = not self.dm_enabled
         await self.service.db_manager.set_global_setting(
-            "api_fallback_enabled", str(new_state)
+            "global_dm_enabled", "true" if new_state else "false"
         )
         await self._update_view(interaction)
 
@@ -308,8 +343,13 @@ class ChatSettingsView(View):
 
         await self._update_view(interaction)
 
-    async def on_entity_select(self, interaction: Interaction, values: List[str]):
+    async def on_entity_select(self, interaction: Interaction):
         """统一处理频道和分类的选择事件。"""
+        if not interaction.data or "values" not in interaction.data:
+            await interaction.response.defer()
+            return
+
+        values = interaction.data["values"]
         if not values or values[0] == "disabled":
             await interaction.response.defer()
             return
@@ -436,6 +476,42 @@ class ChatSettingsView(View):
             on_submit_callback=modal_callback,
         )
         await interaction.response.send_modal(modal)
+
+    async def on_memory_settings(self, interaction: Interaction):
+        """打开记忆总结频率设置模态框。"""
+        current_threshold = personal_memory_service.get_summary_threshold()
+
+        async def modal_callback(
+            modal_interaction: Interaction, settings: Dict[str, Any]
+        ):
+            new_threshold = settings.get("threshold")
+            if new_threshold is not None:
+                personal_memory_service.set_summary_threshold(new_threshold)
+                await modal_interaction.response.send_message(
+                    f"✅ 已成功将记忆总结阈值更新为: **{new_threshold}** 条消息", ephemeral=True
+                )
+
+        modal = MemorySettingsModal(
+            title="设置记忆总结频率",
+            current_threshold=current_threshold,
+            on_submit_callback=modal_callback,
+        )
+        await interaction.response.send_modal(modal)
+
+    async def on_temp_debug_once(self, interaction: Interaction):
+        """激活一次性临时调试 URL。"""
+        debug_url = "http://host.docker.internal:1000"
+        current_model = await self.service.get_current_ai_model()
+        gemini_service.arm_one_time_debug_base_url(debug_url)
+
+        await interaction.response.send_message(
+            (
+                f"✅ 已为当前模型 **{current_model}** 启用一次性临时调试。\n"
+                f"本次将临时把 API URL 指向：`{debug_url}`\n"
+                "下一次发送生效 1 次后会自动恢复原配置。"
+            ),
+            ephemeral=True,
+        )
 
     async def on_show_token_usage(self, interaction: Interaction):
         """显示今天的 Token 使用情况。"""
