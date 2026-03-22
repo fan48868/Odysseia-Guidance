@@ -7,7 +7,7 @@ WORKDIR /opt/pysetup
 COPY requirements.txt .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --target /opt/pysetup/deps -r requirements.txt
+    pip install --target /opt/pysetup/deps -r requirements.txt
 
 FROM python:3.11.5-slim
 
