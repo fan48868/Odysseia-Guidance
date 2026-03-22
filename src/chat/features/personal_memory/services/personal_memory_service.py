@@ -2,7 +2,6 @@ import asyncio
 import logging
 from typing import Optional, Any, List
 import re
-import os
 import datetime
 from sqlalchemy.future import select
 from sqlalchemy import update
@@ -232,11 +231,10 @@ class PersonalMemoryService:
                             "reason": reason,
                         }
                         log.info(
-                            "用户 %s 手动触发个人记忆总结：pairs=%s, limit=%s, reason=%s",
+                            "用户 %s 手动触发个人记忆总结：pairs=%s, limit=%s",
                             user_id,
                             pairs_to_summarize,
                             safe_limit,
-                            reason,
                         )
                     else:
                         log.info(
@@ -341,7 +339,7 @@ class PersonalMemoryService:
                 extra_rules += f"- 触发原因/想记住的关键点：{reason_text}\n"
             final_prompt += extra_rules
 
-        log.info(f"---[MEMORY DEBUGGER]--- 用户 {user_id} 开始总结 ---")
+        log.info("用户 %s 开始执行个人记忆总结。", user_id)
 
         max_retries = 3
         ai_response = None
@@ -453,7 +451,6 @@ class PersonalMemoryService:
             if not unique_added_long_lines:
                 max_force_attempts = 2
                 reason_text = (force_reason or "").strip()
-                existing_list_text = "\n".join(old_long_lines[-30:]) if old_long_lines else "（无）"
                 for attempt in range(max_force_attempts):
                     force_prompt = (
                         "你是记忆管理专家。现在是一次【手动触发】的个人记忆总结。\n"
@@ -544,27 +541,6 @@ class PersonalMemoryService:
 
             added_long_lines = unique_added_long_lines
 
-        # --- 日志记录逻辑 ---
-        log_dir = PERSONAL_MEMORY_CONFIG.get("log_dir")
-        if False and log_dir and (added_long_lines or new_recent_lines):
-            try:
-                if not os.path.exists(log_dir):
-                    os.makedirs(log_dir)
-                
-                today_str = datetime.date.today().strftime("%Y-%m-%d")
-                log_file_path = os.path.join(log_dir, f"memory_summary_{today_str}.log")
-                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                with open(log_file_path, "a", encoding="utf-8") as f:
-                    f.write(f"[{current_time}] User ID: {user_id}\n")
-                    if added_long_lines:
-                        f.write("【新增长期记忆】:\n" + "\n".join(added_long_lines) + "\n")
-                    if new_recent_lines:
-                        f.write("【近期动态】:\n" + "\n".join(new_recent_lines) + "\n")
-                    f.write("-" * 50 + "\n")
-            except Exception as e:
-                log.error(f"写入记忆日志失败: {e}")
-
         # 合并：旧长期 + 新增长期
         final_long_lines = old_long_lines + added_long_lines
 
@@ -576,11 +552,13 @@ class PersonalMemoryService:
             + "\n".join(new_recent_lines)
         )
 
-        log.info(f"---[MEMORY DEBUGGER]--- 用户 {user_id} 总结完毕 ---")
         log.info(
-            f"新增长期记忆: {len(added_long_lines)} 条, 总长期记忆: {len(final_long_lines)} 条"
+            "用户 %s 总结完毕：new_long=%s, total_long=%s, recent=%s",
+            user_id,
+            len(added_long_lines),
+            len(final_long_lines),
+            len(new_recent_lines),
         )
-        log.debug(f"完整的新摘要:\n{final_summary}")
 
         await self.update_summary_manually(user_id, final_summary)
         log.info(f"用户 {user_id} 的总结流程完成。")

@@ -254,6 +254,7 @@ class PersonalMemoryVectorService:
 
             return {"accepted": accepted, "deduped": deduped, "failed": failed}
 
+        batch_duplicates_count = len(deduped)
         async with AsyncSessionLocal() as session:
             for idx, memory_text in enumerate(cleaned_texts, start=1):
                 try:
@@ -269,9 +270,8 @@ class PersonalMemoryVectorService:
                     if keep_unverified_on_failure:
                         accepted.append({"memory_text": memory_text, "embedding": None})
                         log.warning(
-                            "个人记忆语义去重降级保留未校验候选: user_id=%s, candidate=%s, err=%s",
+                            "个人记忆语义去重降级保留未校验候选: user_id=%s, err=%s",
                             discord_id_str,
-                            memory_text,
                             exc,
                         )
                     else:
@@ -297,7 +297,6 @@ class PersonalMemoryVectorService:
                         log.warning(
                             "个人记忆语义去重降级保留未校验候选: user_id=%s, err=empty_embedding",
                             discord_id_str,
-                            memory_text,
                         )
                     else:
                         failed.append(
@@ -348,13 +347,6 @@ class PersonalMemoryVectorService:
                             "matched_existing_embedding": existing_match.get("embedding"),
                         }
                     )
-                    representatives.append(
-                        {
-                            "memory_text": memory_text,
-                            "embedding": embedding,
-                            "source": "existing",
-                        }
-                    )
                     continue
 
                 accepted.append({"memory_text": memory_text, "embedding": embedding})
@@ -365,6 +357,18 @@ class PersonalMemoryVectorService:
                         "source": "accepted",
                     }
                 )
+
+        semantic_deduped_count = len(deduped) - batch_duplicates_count
+        if deduped or failed:
+            log.info(
+                "个人记忆语义去重完成: user_id=%s, received=%s, accepted=%s, deduped_exact=%s, deduped_semantic=%s, failed=%s",
+                discord_id_str,
+                len(cleaned_texts),
+                len(accepted),
+                batch_duplicates_count,
+                semantic_deduped_count,
+                len(failed),
+            )
 
         return {"accepted": accepted, "deduped": deduped, "failed": failed}
 

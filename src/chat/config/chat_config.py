@@ -40,7 +40,7 @@ HIDDEN_TOOLS = ["issue_user_warning"]
 GEMINI_MODEL = "gemini-2.5-flash"
 
 # 用于个人记忆摘要的模型。
-SUMMARY_MODEL = "gemini-2.5-flash"
+SUMMARY_MODEL = "gemini-2.5-flash-lite"
 
 # --- 自定义 Gemini 端点配置 ---
 # 用于通过自定义 URL (例如公益站) 调用模型
@@ -327,7 +327,7 @@ COIN_CONFIG = {
 PERSONAL_MEMORY_CONFIG = {
     "summary_threshold": 20,  # 触发总结的消息数量阈值 (测试用 5, 原为 50)
     "log_dir": None,  # 关闭自动写入 memory summary 日志
-    "semantic_dedupe_max_distance": 0.25,  # 个人长期记忆语义去重的 cosine distance 阈值
+    "semantic_dedupe_max_distance": 0.12,  # 个人长期记忆语义去重的 cosine distance 阈值；值越大越容易判定为重复
 }
 
 
