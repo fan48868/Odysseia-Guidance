@@ -304,7 +304,10 @@ src/chat/features/games/blackjack-web/vite.config.ts
 # Ignore tutorial source files, as they are processed into the database
 tutorial/
 测试.py
-src/backup/
 backup/odysseia_paradedb_20260321_004039.dump
 backup/runtime_data_20260321_004039.zip
 backup/project_20260321_004039.tar.gz
+src/backup/chat.db.bak.*
+src/backup/forum_sync_status.db.bak.*
+src/backup/world_book.sqlite3.bak.*
+src/backup/guidance.db.bak.*
