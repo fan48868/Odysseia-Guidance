@@ -181,6 +181,9 @@ MODEL_GENERATION_CONFIG = {
     "kimi-k2.5": {
         "temperature": 0.6,
     },
+    "custom":{
+        "temperature": 0.95,
+    },
 
     # 你可以在这里为其他模型添加更多自定义配置
     # "gemini-2.5-pro-custom": { ... },

@@ -8,7 +8,8 @@ services:
       - RUNNING_IN_DOCKER=true
       - DB_HOST=db
       - DB_PORT=5432
-
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # --- 部署方式二选一 ---
     # 方式一 (推荐): 从本地源代码构建
     # 优点: 使用最新代码、方便调试
