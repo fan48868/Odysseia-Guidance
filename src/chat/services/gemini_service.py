@@ -42,6 +42,13 @@ from src.chat.services.openai_service import OpenAIService
 
 log = logging.getLogger(__name__)
 
+OPENAI_COMPATIBLE_MODELS = {
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "kimi-k2.5",
+    "custom",
+}
+
 # --- 设置专门用于记录无效 API 密钥的 logger ---
 # 确保 data 目录存在
 if not os.path.exists("data"):
@@ -74,6 +81,21 @@ def _api_key_handler(func: Callable) -> Callable:
     """
     @wraps(func)
     async def wrapper(self: "GeminiService", *args, **kwargs):
+        requested_model_name = kwargs.get("model_name")
+        if (
+            requested_model_name is None
+            and func.__name__ == "generate_simple_response"
+            and len(args) >= 3
+        ):
+            requested_model_name = args[2]
+
+        # OpenAI 兼容模型的单轮文本生成不需要 Gemini client，直接交给函数内部路由。
+        if (
+            func.__name__ == "generate_simple_response"
+            and requested_model_name in OPENAI_COMPATIBLE_MODELS
+        ):
+            return await func(self, *args, **kwargs)
+
         # [逻辑分流] 判断当前任务类型
         is_embedding_task = func.__name__ == "generate_embedding"
 
@@ -1651,6 +1673,13 @@ class GeminiService:
         Returns:
             生成的文本字符串，如果失败则返回 None。
         """
+        if model_name in OPENAI_COMPATIBLE_MODELS:
+            return await self.openai_service.generate_simple_text(
+                prompt=prompt,
+                model_name=model_name,
+                generation_config=generation_config,
+            )
+
         if not client:
             raise ValueError("装饰器未能提供客户端实例。")
 

@@ -163,6 +163,267 @@ class OpenAIService:
 
                 await asyncio.sleep(retry_delay_seconds)
 
+    async def generate_simple_text(
+        self,
+        prompt: str,
+        model_name: str,
+        generation_config: Optional[Dict[str, Any]] = None,
+        user_id: int = 0,
+        override_base_url: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        单轮、无工具的 OpenAI 兼容文本生成。
+
+        用于内部任务，例如个人记忆摘要、礼物感谢词等一次性 prompt。
+        这里不构建完整聊天上下文，也不执行工具调用。
+        """
+        effective_model_name = model_name or "deepseek-chat"
+        is_deepseek_model = effective_model_name in {
+            "deepseek-chat",
+            "deepseek-reasoner",
+        }
+        is_custom_model = effective_model_name == "custom"
+        is_kimi_model = effective_model_name == "kimi-k2.5"
+
+        if not (is_deepseek_model or is_custom_model or is_kimi_model):
+            log.warning(
+                "[OpenAI Simple] 非 OpenAI 兼容模型不应走此路径: %s",
+                effective_model_name,
+            )
+            return None
+
+        custom_runtime_config: Optional[Dict[str, Any]] = None
+        if is_custom_model:
+            custom_runtime_config = self.custom_model_client.refresh_from_env()
+
+        if is_deepseek_model:
+            channel_label = "DeepSeek"
+            validation_error = self.deepseek_model_client.get_validation_error(
+                effective_model_name
+            )
+        elif is_custom_model:
+            channel_label = "Custom"
+            validation_error = self.custom_model_client.get_validation_error(
+                runtime_config=custom_runtime_config
+            )
+        else:
+            channel_label = "Kimi"
+            validation_error = self.kimi_model_client.get_validation_error()
+
+        if validation_error:
+            log.warning(
+                "[%s Simple] 模型校验失败: %s",
+                channel_label,
+                validation_error,
+            )
+            return None
+
+        gen_config = dict(generation_config or {})
+        if not gen_config:
+            gen_config = app_config.MODEL_GENERATION_CONFIG.get(
+                effective_model_name,
+                app_config.MODEL_GENERATION_CONFIG["default"],
+            )
+
+        if is_deepseek_model:
+            request_model_name = effective_model_name
+        elif is_custom_model:
+            request_model_name = self.custom_model_client.get_request_model_name(
+                effective_model_name,
+                runtime_config=custom_runtime_config,
+            )
+        else:
+            request_model_name = self.kimi_model_client.get_request_model_name()
+
+        payload: Dict[str, Any] = {
+            "model": request_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": is_custom_model,
+            "temperature": gen_config.get("temperature", 1.3),
+            "top_p": gen_config.get("top_p", 0.95),
+            "max_tokens": gen_config.get("max_output_tokens", 8192),
+        }
+        if is_kimi_model:
+            payload["thinking"] = {"type": "disabled"}
+
+        http_client = httpx.AsyncClient(timeout=120.0)
+
+        async def recreate_http_client(
+            attempt: int, error: httpx.RequestError
+        ) -> None:
+            nonlocal http_client
+
+            stale_http_client = http_client
+            http_client = httpx.AsyncClient(timeout=120.0)
+
+            try:
+                await stale_http_client.aclose()
+            except Exception as close_error:
+                log.warning(
+                    "[Custom Simple] Failed to close stale HTTP client before retry | attempt=%s | request_error=%s | close_error=%s",
+                    attempt + 1,
+                    type(error).__name__,
+                    close_error,
+                )
+
+        try:
+            if is_deepseek_model:
+                request_result = await self._send_with_network_retry_once(
+                    channel_label=channel_label,
+                    send_coro_factory=lambda: self.deepseek_model_client.send(
+                        http_client=http_client,
+                        payload=payload,
+                        override_base_url=override_base_url,
+                    ),
+                )
+            elif is_custom_model:
+                request_result = await self._send_with_network_retry_once(
+                    channel_label=channel_label,
+                    send_coro_factory=lambda: self.custom_model_client.send(
+                        http_client=http_client,
+                        payload=payload,
+                        override_base_url=override_base_url,
+                        runtime_config=custom_runtime_config,
+                    ),
+                    on_retry=recreate_http_client,
+                )
+            else:
+                request_result = await self._send_with_network_retry_once(
+                    channel_label=channel_label,
+                    send_coro_factory=lambda: self.kimi_model_client.send(
+                        http_client=http_client,
+                        payload=payload,
+                        user_id=user_id,
+                        override_base_url=override_base_url,
+                    ),
+                )
+
+            response: httpx.Response = request_result["response"]
+            used_api_url = str(request_result.get("used_api_url", ""))
+            response.raise_for_status()
+
+            result: Optional[Dict[str, Any]] = None
+            if is_custom_model and self.custom_model_client.is_sse_chat_completion_response(
+                response
+            ):
+                result = self.custom_model_client.parse_streaming_chat_completion_body(
+                    response.text or ""
+                )
+                if not result:
+                    log.error(
+                        "[Custom Simple] 流式响应解析失败：无法从 SSE 数据中重建有效消息。"
+                    )
+                    return None
+
+            try:
+                if result is None:
+                    result = response.json()
+            except json.JSONDecodeError:
+                response_text = (response.text or "").strip()
+                body_preview = response_text[:1200] if response_text else "<empty>"
+                content_type = response.headers.get("content-type", "<none>")
+                server = response.headers.get("server", "<none>")
+                log.error(
+                    "[%s Simple] 返回非 JSON 响应 | status=%s | content_type=%s | server=%s | url=%s | body=%s",
+                    channel_label,
+                    response.status_code,
+                    content_type,
+                    server,
+                    used_api_url,
+                    body_preview,
+                )
+                return None
+
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                log.warning(
+                    "[%s Simple] 响应缺少 choices 字段: %s",
+                    channel_label,
+                    result,
+                )
+                return None
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                log.warning(
+                    "[%s Simple] choices[0] 不是对象: %s",
+                    channel_label,
+                    first_choice,
+                )
+                return None
+
+            response_message = first_choice.get("message")
+            if not isinstance(response_message, dict):
+                response_message = (
+                    first_choice.get("delta")
+                    if isinstance(first_choice.get("delta"), dict)
+                    else {}
+                )
+
+            content = response_message.get("content") or ""
+            if isinstance(content, list):
+                content = self.kimi_model_client.extract_text_from_openai_content(
+                    content
+                )
+            elif not isinstance(content, str):
+                content = str(content).strip() if content else ""
+
+            final_text = content.strip()
+            if final_text:
+                return final_text
+
+            log.warning(
+                "[%s Simple] 未能生成有效文本内容。finish_reason=%s, response=%s",
+                channel_label,
+                first_choice.get("finish_reason"),
+                result,
+            )
+            return None
+
+        except NoAvailableKimiKeyError as e:
+            log.error("[Kimi Simple] %s", str(e) or "当前没有可用的 Kimi Key。")
+            return None
+        except httpx.HTTPStatusError as e:
+            response_text = ""
+            try:
+                response_text = e.response.text
+            except Exception:
+                response_text = "<无法读取响应体>"
+
+            log.error(
+                "[%s Simple] HTTP 错误: %s | detail=%s",
+                channel_label,
+                e,
+                response_text[:1000],
+                exc_info=True,
+            )
+            return None
+        except httpx.RequestError as e:
+            err_fields = self._build_request_error_log_fields(e)
+            log.error(
+                "[%s Simple] 网络请求失败 | exc_type=%s | exc_repr=%s | exc_str=%s | cause_type=%s | cause_repr=%s | request_method=%s | request_url=%s",
+                channel_label,
+                err_fields["exc_type"],
+                err_fields["exc_repr"],
+                err_fields["exc_str"],
+                err_fields["cause_type"],
+                err_fields["cause_repr"],
+                err_fields["request_method"],
+                err_fields["request_url"],
+                exc_info=True,
+            )
+            return None
+        except Exception as e:
+            log.error(
+                "[%s Simple] 生成失败: %s",
+                channel_label,
+                e,
+                exc_info=True,
+            )
+            return None
+        finally:
+            await http_client.aclose()
+
     async def generate_response(
         self,
         user_id: int,
