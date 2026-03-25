@@ -285,11 +285,6 @@ class GuidanceBot(commands.Bot):
                     continue
 
 
-                # --- 临时禁用图像生成 ---
-                if file.name == "image_generation_cog.py":
-                    log.warning(f"已根据指令临时跳过加载: {file.name}")
-                    continue
-
                 # 从文件系统路径构建 Python 模块路径
                 # 例如: E:\...\src\chat\...\feeding_cog.py -> src.chat....feeding_cog
                 relative_path = file.relative_to(src_root.parent)
