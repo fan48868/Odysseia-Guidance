@@ -26,6 +26,8 @@ class CustomModelClient:
         self._api_keys: List[str] = []
         self._active_api_key_index = 0
         self._key_rotation_lock = asyncio.Lock()
+        self._provider_order_rotation_lock = asyncio.Lock()
+        self._provider_order_offset_by_model: Dict[str, int] = {}
         self.raw_api_key: Optional[str] = None
         self._gateway_options_log_once: set[str] = set()
         runtime_config = self.refresh_from_env()
@@ -274,6 +276,39 @@ class CustomModelClient:
             return ""
 
         return model.split("/", 1)[0].strip()
+
+    async def _get_rotated_provider_order(
+        self, *, model_key: str, base_order: List[str]
+    ) -> List[str]:
+        if not base_order:
+            return []
+
+        normalized_key = str(model_key or "").strip().lower()
+        if not normalized_key:
+            return list(base_order)
+
+        async with self._provider_order_rotation_lock:
+            offset = self._provider_order_offset_by_model.get(normalized_key, 0)
+
+        normalized_offset = offset % len(base_order)
+        return base_order[normalized_offset:] + base_order[:normalized_offset]
+
+    async def _advance_rotated_provider_order(
+        self, *, model_key: str, base_order: List[str]
+    ) -> List[str]:
+        if not base_order:
+            return []
+
+        normalized_key = str(model_key or "").strip().lower()
+        if not normalized_key:
+            return list(base_order)
+
+        async with self._provider_order_rotation_lock:
+            current_offset = self._provider_order_offset_by_model.get(normalized_key, 0)
+            next_offset = (current_offset + 1) % len(base_order)
+            self._provider_order_offset_by_model[normalized_key] = next_offset
+
+        return base_order[next_offset:] + base_order[:next_offset]
 
     @staticmethod
     def _has_meaningful_sse_output(payload: Dict[str, Any]) -> bool:
@@ -833,11 +868,15 @@ class CustomModelClient:
         is_vercel_gateway = "ai-gateway.vercel.sh" in api_url.lower()
         is_kimi_k2_5_model = normalized_request_model == "moonshotai/kimi-k2.5"
         kimi_k2_5_provider_order = [
-            "fireworks",
-            "togetherai",
             "moonshotai",
-            "bedrock",
+            "fireworks",
         ]
+        active_kimi_provider_order = list(kimi_k2_5_provider_order)
+        if is_kimi_k2_5_model:
+            active_kimi_provider_order = await self._get_rotated_provider_order(
+                model_key=normalized_request_model,
+                base_order=kimi_k2_5_provider_order,
+            )
         provider_timeout_injected = False
         provider_order_injected = False
 
@@ -870,8 +909,8 @@ class CustomModelClient:
 
             if is_kimi_k2_5_model:
                 existing_order = gateway_options.get("order")
-                if existing_order != kimi_k2_5_provider_order:
-                    gateway_options["order"] = list(kimi_k2_5_provider_order)
+                if existing_order != active_kimi_provider_order:
+                    gateway_options["order"] = list(active_kimi_provider_order)
                     provider_order_injected = True
 
             provider_timeouts["byok"] = byok_timeouts
@@ -1108,12 +1147,26 @@ class CustomModelClient:
                     break
             except httpx.RequestError as exc:
                 elapsed_total_seconds = loop.time() - request_started_at
+                next_kimi_provider_order: Optional[List[str]] = None
+                if is_vercel_gateway and is_kimi_k2_5_model:
+                    next_kimi_provider_order = await self._advance_rotated_provider_order(
+                        model_key=normalized_request_model,
+                        base_order=kimi_k2_5_provider_order,
+                    )
+                    log.warning(
+                        "[Custom] Rotated provider order for retry after network error | model=%s | from=%s | to=%s",
+                        request_model_name,
+                        active_kimi_provider_order,
+                        next_kimi_provider_order,
+                    )
+
                 log.warning(
                     "[Custom] Stream request error | attempt=%s/%s | phase=%s | elapsed=%.2fs | "
                     "net_timeout(connect/read/write/pool)=%.1f/%.1f/%.1f/%.1f | "
                     "first_token_timeout=%.1fs | idle_timeout=%.1fs | "
                     "received_first_meaningful_token=%s | body_lines=%s | meaningful_lines=%s | "
                     "used_streaming=%s | saw_non_sse_payload=%s | model=%s | url=%s | "
+                    "order=%s | next_order=%s | "
                     "exc_type=%s | exc=%s",
                     attempt + 1,
                     max_key_attempts,
@@ -1132,6 +1185,8 @@ class CustomModelClient:
                     saw_non_sse_payload,
                     str(request_payload.get("model", "")),
                     api_url,
+                    active_kimi_provider_order if is_kimi_k2_5_model else None,
+                    next_kimi_provider_order,
                     type(exc).__name__,
                     exc,
                 )
