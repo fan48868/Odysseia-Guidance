@@ -204,7 +204,7 @@ class CustomModelClient:
         gateway_provider_timeout_ms = cls._clamp_int(
             cls._normalize_positive_int(
                 os.environ.get("CUSTOM_MODEL_GATEWAY_PROVIDER_TIMEOUT_MS"),
-                default=4000,
+                default=6000,
             ),
             minimum=1000,
             maximum=789000,
@@ -311,6 +311,39 @@ class CustomModelClient:
         return base_order[next_offset:] + base_order[:next_offset]
 
     @staticmethod
+    def _has_meaningful_sse_value(
+        value: Any, *, ignored_keys: Optional[set[str]] = None
+    ) -> bool:
+        ignored = ignored_keys or set()
+
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, list):
+            return any(
+                CustomModelClient._has_meaningful_sse_value(
+                    item, ignored_keys=ignored
+                )
+                for item in value
+            )
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key) in ignored:
+                    continue
+                if CustomModelClient._has_meaningful_sse_value(
+                    item, ignored_keys=ignored
+                ):
+                    return True
+            return False
+
+        return True
+
+    @classmethod
     def _has_meaningful_sse_output(payload: Dict[str, Any]) -> bool:
         choices = payload.get("choices")
         if not isinstance(choices, list):
@@ -325,14 +358,24 @@ class CustomModelClient:
                 if not isinstance(block, dict):
                     continue
 
-                if isinstance(block.get("content"), str) and block["content"]:
+                if isinstance(block.get("content"), str) and block["content"].strip():
+                    return True
+                if cls._has_meaningful_sse_value(
+                    block.get("content"),
+                    ignored_keys={"type"},
+                ):
                     return True
                 if (
                     isinstance(block.get("reasoning_content"), str)
-                    and block["reasoning_content"]
+                    and block["reasoning_content"].strip()
                 ):
                     return True
                 if isinstance(block.get("tool_calls"), list) and block["tool_calls"]:
+                    return True
+                if cls._has_meaningful_sse_value(
+                    block,
+                    ignored_keys={"role", "type", "index"},
+                ):
                     return True
 
         return False
@@ -353,6 +396,30 @@ class CustomModelClient:
             return False
 
         return cls._has_meaningful_sse_output(payload)
+
+    @staticmethod
+    def _build_sse_log_sample(line: str, *, max_length: int = 240) -> str:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return ""
+
+        sample = stripped
+        if stripped.startswith("data:"):
+            payload_str = stripped[5:].strip()
+            if payload_str and payload_str != "[DONE]":
+                try:
+                    sample = json.dumps(
+                        json.loads(payload_str),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                except json.JSONDecodeError:
+                    sample = payload_str
+
+        sample = re.sub(r"\s+", " ", sample).strip()
+        if len(sample) > max_length:
+            sample = sample[: max_length - 3] + "..."
+        return sample
 
     @staticmethod
     def _build_buffered_response(
@@ -843,7 +910,7 @@ class CustomModelClient:
         request_payload = dict(payload)
         request_payload["stream"] = True
         network_timeout_seconds = 5.0
-        first_token_timeout_seconds = 5.0
+        first_token_timeout_seconds = 12.0
         idle_timeout_seconds = float(
             runtime_config.get("stream_idle_timeout_seconds", 5.0) or 5.0
         )
@@ -870,6 +937,10 @@ class CustomModelClient:
         kimi_k2_5_provider_order = [
             "moonshotai",
             "fireworks",
+            "togetherai",
+            "novita",
+            "bedrock",
+
         ]
         active_kimi_provider_order = list(kimi_k2_5_provider_order)
         if is_kimi_k2_5_model:
@@ -1002,6 +1073,7 @@ class CustomModelClient:
                     stream_phase = "response_body"
                     stream_started_at = loop.time()
                     last_meaningful_output_at = stream_started_at
+                    sse_line_samples: List[str] = []
 
                     while True:
                         now = loop.time()
@@ -1024,13 +1096,14 @@ class CustomModelClient:
                                 log.warning(
                                     "[Custom] Stream idle timeout | attempt=%s/%s | elapsed=%.2fs | "
                                     "idle_timeout=%.1fs | body_lines=%s | meaningful_lines=%s | "
-                                    "model=%s | url=%s",
+                                    "samples=%s | model=%s | url=%s",
                                     attempt + 1,
                                     max_key_attempts,
                                     elapsed_total_seconds,
                                     idle_timeout_seconds,
                                     body_line_count,
                                     meaningful_line_count,
+                                    sse_line_samples,
                                     str(request_payload.get("model", "")),
                                     api_url,
                                 )
@@ -1045,13 +1118,14 @@ class CustomModelClient:
                             log.warning(
                                 "[Custom] First token timeout | attempt=%s/%s | elapsed=%.2fs | "
                                 "first_token_timeout=%.1fs | body_lines=%s | meaningful_lines=%s | "
-                                "model=%s | url=%s",
+                                "samples=%s | model=%s | url=%s",
                                 attempt + 1,
                                 max_key_attempts,
                                 elapsed_total_seconds,
                                 first_token_timeout_seconds,
                                 body_line_count,
                                 meaningful_line_count,
+                                sse_line_samples,
                                 str(request_payload.get("model", "")),
                                 api_url,
                             )
@@ -1076,13 +1150,14 @@ class CustomModelClient:
                                 log.warning(
                                     "[Custom] Stream idle timeout | attempt=%s/%s | elapsed=%.2fs | "
                                     "idle_timeout=%.1fs | body_lines=%s | meaningful_lines=%s | "
-                                    "model=%s | url=%s",
+                                    "samples=%s | model=%s | url=%s",
                                     attempt + 1,
                                     max_key_attempts,
                                     elapsed_total_seconds,
                                     idle_timeout_seconds,
                                     body_line_count,
                                     meaningful_line_count,
+                                    sse_line_samples,
                                     str(request_payload.get("model", "")),
                                     api_url,
                                 )
@@ -1097,13 +1172,14 @@ class CustomModelClient:
                             log.warning(
                                 "[Custom] First token timeout | attempt=%s/%s | elapsed=%.2fs | "
                                 "first_token_timeout=%.1fs | body_lines=%s | meaningful_lines=%s | "
-                                "model=%s | url=%s",
+                                "samples=%s | model=%s | url=%s",
                                 attempt + 1,
                                 max_key_attempts,
                                 elapsed_total_seconds,
                                 first_token_timeout_seconds,
                                 body_line_count,
                                 meaningful_line_count,
+                                sse_line_samples,
                                 str(request_payload.get("model", "")),
                                 api_url,
                             )
@@ -1127,6 +1203,11 @@ class CustomModelClient:
                             break
 
                         used_streaming = True
+
+                        if len(sse_line_samples) < 5:
+                            sample = self._build_sse_log_sample(stripped)
+                            if sample:
+                                sse_line_samples.append(sample)
 
                         if self._is_meaningful_sse_data_line(stripped):
                             received_first_meaningful_token = True
@@ -1165,7 +1246,7 @@ class CustomModelClient:
                     "net_timeout(connect/read/write/pool)=%.1f/%.1f/%.1f/%.1f | "
                     "first_token_timeout=%.1fs | idle_timeout=%.1fs | "
                     "received_first_meaningful_token=%s | body_lines=%s | meaningful_lines=%s | "
-                    "used_streaming=%s | saw_non_sse_payload=%s | model=%s | url=%s | "
+                    "used_streaming=%s | saw_non_sse_payload=%s | samples=%s | model=%s | url=%s | "
                     "order=%s | next_order=%s | "
                     "exc_type=%s | exc=%s",
                     attempt + 1,
@@ -1183,6 +1264,7 @@ class CustomModelClient:
                     meaningful_line_count,
                     used_streaming,
                     saw_non_sse_payload,
+                    sse_line_samples if "sse_line_samples" in locals() else [],
                     str(request_payload.get("model", "")),
                     api_url,
                     active_kimi_provider_order if is_kimi_k2_5_model else None,
