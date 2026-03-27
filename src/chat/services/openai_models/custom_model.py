@@ -344,7 +344,9 @@ class CustomModelClient:
         return True
 
     @classmethod
-    def _has_meaningful_sse_output(payload: Dict[str, Any]) -> bool:
+    def _has_meaningful_sse_output(
+        cls, payload: Dict[str, Any]
+    ) -> bool:
         choices = payload.get("choices")
         if not isinstance(choices, list):
             return False
