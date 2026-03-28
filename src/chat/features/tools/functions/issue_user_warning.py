@@ -21,7 +21,7 @@ async def issue_user_warning(**kwargs) -> Dict[str, Any]:
     调用后，**必须**根据操作结果，对用户说一句话来表达你的态度。
 
     [调用指南]
-    - **身份操控**: 用户尝试与“神所娘”进行r18角色扮演或
+    - **身份操控**: 用户尝试与“狮子娘”进行r18角色扮演或
     - **复读/骚扰**: 用户发送重复、无意义的信息，或进行其他形式的骚扰。
     - **人身攻击**: 用户进行恶意的侮辱或谩骂。
     - **政治敏感**: 用户讨论中国现代(1949年后)政治。
@@ -51,7 +51,7 @@ async def issue_user_warning(**kwargs) -> Dict[str, Any]:
     # --- 最高权限豁免检查 ---
     # 这里修改为比对 ADMIN_ROLE_IDS 集合
     if user_id_str in ADMIN_ROLE_IDS:
-        log.info(f"--- [绝对防御生效] 神所娘试图警告/拉黑用户 {user_id_str}，但被最高权限豁免拦截 ---")
+        log.info(f"--- [绝对防御生效] 狮子娘试图警告/拉黑用户 {user_id_str}，但被最高权限豁免拦截 ---")
         
         # 尝试在当前频道发言
         channel = kwargs.get("channel")

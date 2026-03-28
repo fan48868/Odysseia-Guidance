@@ -64,7 +64,7 @@ async def _background_generate_and_send(channel: discord.abc.Messageable, params
         filepath = result[0] # Gradio 返回的元组中，索引 0 是文件绝对路径
         
         # 处理文件名
-        raw_name = params.filename or "神所娘的语音消息"
+        raw_name = params.filename or "狮子娘的语音消息"
         clean_name = re.sub(r'[\\/:*?"<>|]', '', raw_name)[:10]
         display_filename = f"{clean_name}.wav" # Qwen3 通常输出 wav
 

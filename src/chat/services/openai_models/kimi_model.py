@@ -28,7 +28,7 @@ class KimiModelClient:
     def __init__(
         self,
         bot_getter: Optional[Callable[[], Any]] = None,
-        alert_user_id: int = 1046310552365973524,
+        alert_user_id: int = 1449321391412215908,
     ) -> None:
         self.bot_getter = bot_getter
         self.alert_user_id = alert_user_id

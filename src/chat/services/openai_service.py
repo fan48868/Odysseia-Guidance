@@ -53,7 +53,7 @@ class OpenAIService:
         self.custom_model_client = CustomModelClient()
         self.kimi_model_client = KimiModelClient(
             bot_getter=lambda: getattr(self.tool_service, "bot", None),
-            alert_user_id=1046310552365973524,
+            alert_user_id=1449321391412215908,
         )
 
     @staticmethod

@@ -94,7 +94,7 @@ async def tts_tool(
         except Exception as e:
             return f"参数解析失败: {e}"
     # 文件名处理：移除非法字符并限制长度
-    raw_name = params.filename or "神所娘的语音消息"
+    raw_name = params.filename or "狮子娘的语音消息"
     clean_name = re.sub(r'[\\/:*?"<>|]', '', raw_name)[:10]
     display_filename = f"{clean_name}.mp3"
 
