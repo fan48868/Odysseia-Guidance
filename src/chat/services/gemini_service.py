@@ -1098,6 +1098,7 @@ class GeminiService:
         [新增] 核心的 AI 生成周期，包含上下文构建、工具调用循环和响应处理。
         此方法被 _generate_with_official_api 和 _generate_with_custom_endpoint 复用。
         """
+
         # 自动 RAG 检索逻辑：如果调用方没传条目，且有用户消息，我们就自己去数据库搜！
         if not world_book_entries and message:
             try:
@@ -1114,6 +1115,13 @@ class GeminiService:
                     log.info(f"📚 触发世界书/成员设定，已注入 Prompt: {titles}")
             except Exception as e:
                 log.warning(f"世界书自动检索失败 (不影响正常对话): {e}")
+
+        # ---------- 用户名处理（放在 RAG 之后，避免影响匹配）----------
+        TARGET_USER_ID = 1449321391412215908  # 软软 ID，可移到配置
+        if user_id != TARGET_USER_ID:
+            user_name = f"【社区朋友】{user_name}"
+        # --------------------------------------------------------
+        
         # --- 模型使用计数 ---
         # 使用 prompt_model_name (表面模型名) 进行计数，而不是 api_model_name (真实模型名)
         model_to_count = prompt_model_name or self.default_model_name

@@ -115,23 +115,6 @@ class PromptService:
 
         return prompt_template
 
-    def _mask_potential_impersonator_name(
-        self, user_name: Optional[str], user_id: Optional[int]
-    ) -> str:
-        """
-        防冒名：当用户名包含 "ouqiting" 且 ID 不是 1046310552365973524 时，显示为“冒牌货”。
-        """
-        display_name = user_name or "未知用户"
-        is_real_ouqiting = str(user_id) == "1046310552365973524"
-
-        if ("ouqiting" in display_name.lower() or "1046310552365973524" in display_name.lower()) and not is_real_ouqiting:
-            log.warning(
-                f"检测到疑似冒充 ouqiting，原名: {display_name}, user_id: {user_id}，已替换为冒牌货。"
-            )
-            return "冒牌货"
-
-        return display_name
-
     @staticmethod
     def _extract_bot_display_names(channel: Optional[Any]) -> List[str]:
         if not channel or not hasattr(channel, "guild") or not channel.guild:

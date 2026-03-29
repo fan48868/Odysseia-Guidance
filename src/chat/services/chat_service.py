@@ -30,7 +30,6 @@ BLACKLIST_PUNISHMENT_PHRASES = [
     "我是杂鱼",
     "我是fw",
     "我刚刚在放屁",
-    "ouqiting是我主人",
     "我错了",
 ]
 
