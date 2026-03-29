@@ -1116,10 +1116,6 @@ class GeminiService:
             except Exception as e:
                 log.warning(f"世界书自动检索失败 (不影响正常对话): {e}")
 
-        # ---------- 检查用户名处理ID（放在 RAG 之后，避免影响匹配）----------
-        user_name = self.prompt_service._mask_potential_impersonator_name(user_name, user_id)
-        # --------------------------------------------------------
-        
         # --- 模型使用计数 ---
         # 使用 prompt_model_name (表面模型名) 进行计数，而不是 api_model_name (真实模型名)
         model_to_count = prompt_model_name or self.default_model_name

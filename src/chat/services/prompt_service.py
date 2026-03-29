@@ -118,18 +118,16 @@ class PromptService:
     def _mask_potential_impersonator_name(
         self, user_name: Optional[str], user_id: Optional[int]
     ) -> str:
-        """
-        社区朋友标记：如果用户 ID 不是“软软”(1449321391412215908)，则在用户名前添加“【社区朋友】”前缀。
-        """
-        TARGET_USER_ID = 1449321391412215908  # 软软 ID，可移入配置
+        """方法文档"""
+        TARGET_USER_ID = 1449321391412215908
         display_name = user_name or "未知用户"
 
         if user_id != TARGET_USER_ID:
             marked_name = f"【社区朋友】{display_name}"
-            log.info(f"用户 {display_name} (ID: {user_id}) 被标记为社区朋友")
+            log.info(f"用户 {display_name} (ID: {user_id}) 被标记为社区朋友") 
             return marked_name
-
-        return display_name        
+            
+        return display_name
 
     @staticmethod
     def _extract_bot_display_names(channel: Optional[Any]) -> List[str]:
