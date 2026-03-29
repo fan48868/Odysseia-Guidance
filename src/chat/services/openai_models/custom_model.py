@@ -13,13 +13,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from PIL import Image
+from dotenv import set_key
 
+from src import config
 from src.chat.services.moonshot_vision_service import moonshot_vision_service
 
 log = logging.getLogger(__name__)
 
 
 class CustomModelClient:
+    _PRIMARY_API_KEY_ENV_NAME = "CUSTOM_MODEL_API_KEY"
+    _LEGACY_API_KEY_ENV_NAME = "CUSTON_MODEL_API_KEY"
     """Custom OpenAI 兼容通道客户端：负责配置管理、请求发送与 Custom 专属解析。"""
 
     def __init__(self) -> None:
@@ -28,6 +32,7 @@ class CustomModelClient:
         self._key_rotation_lock = asyncio.Lock()
         self._provider_order_rotation_lock = asyncio.Lock()
         self._provider_order_offset_by_model: Dict[str, int] = {}
+        self.api_key: Optional[str] = None
         self.raw_api_key: Optional[str] = None
         self._gateway_options_log_once: set[str] = set()
         runtime_config = self.refresh_from_env()
@@ -103,6 +108,56 @@ class CustomModelClient:
         return api_key[-4:]
 
     @staticmethod
+    def _serialize_api_keys(api_keys: List[str]) -> str:
+        return ",".join(str(key).strip() for key in api_keys if str(key).strip())
+
+    @staticmethod
+    def _get_env_path() -> str:
+        return os.path.join(config.BASE_DIR, ".env")
+
+    def _apply_api_key_state(self, api_keys: List[str], *, active_index: int = 0) -> str:
+        normalized_keys = self._split_api_keys(self._serialize_api_keys(api_keys))
+        serialized_api_keys = self._serialize_api_keys(normalized_keys)
+        self._api_keys = normalized_keys
+        self.raw_api_key = serialized_api_keys or None
+
+        if not normalized_keys:
+            self._active_api_key_index = 0
+            self.api_key = None
+            return serialized_api_keys
+
+        normalized_index = min(max(active_index, 0), len(normalized_keys) - 1)
+        self._active_api_key_index = normalized_index
+        self.api_key = normalized_keys[normalized_index]
+        return serialized_api_keys
+
+    @classmethod
+    def _persist_api_keys_to_env(cls, serialized_api_keys: str) -> bool:
+        os.environ[cls._PRIMARY_API_KEY_ENV_NAME] = serialized_api_keys
+        if cls._LEGACY_API_KEY_ENV_NAME in os.environ:
+            os.environ[cls._LEGACY_API_KEY_ENV_NAME] = serialized_api_keys
+
+        env_path = cls._get_env_path()
+        try:
+            os.makedirs(os.path.dirname(env_path), exist_ok=True)
+            set_key(
+                env_path,
+                cls._PRIMARY_API_KEY_ENV_NAME,
+                serialized_api_keys,
+                quote_mode="always",
+                encoding="utf-8",
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "[Custom] Failed to persist %s to .env: %s",
+                cls._PRIMARY_API_KEY_ENV_NAME,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
     def _is_payment_required_error(
         status_code: int, combined_error_text: str
     ) -> bool:
@@ -116,20 +171,17 @@ class CustomModelClient:
         if self._api_keys and 0 <= self._active_api_key_index < len(self._api_keys):
             current_key = self._api_keys[self._active_api_key_index]
 
-        self._api_keys = keys
-
         if not keys:
-            self._active_api_key_index = 0
-            self.api_key = None
-            return keys
+            self._apply_api_key_state([], active_index=0)
+            return self._api_keys
 
         if current_key in keys:
-            self._active_api_key_index = keys.index(current_key)
+            active_index = keys.index(current_key)
         else:
-            self._active_api_key_index = 0
+            active_index = 0
 
-        self.api_key = keys[self._active_api_key_index]
-        return keys
+        self._apply_api_key_state(keys, active_index=active_index)
+        return self._api_keys
 
     def _get_active_api_key_snapshot(
         self, runtime_config: Dict[str, Any]
@@ -151,6 +203,7 @@ class CustomModelClient:
         failed_index: int,
         total_keys: int,
         reason_preview: str,
+        runtime_config: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if total_keys <= 1:
             return False
@@ -165,21 +218,34 @@ class CustomModelClient:
             active_key = self._api_keys[active_index]
 
             if active_key == failed_api_key and active_index == failed_index:
-                next_index = (active_index + 1) % len(self._api_keys)
-                self._active_api_key_index = next_index
-                next_key = self._api_keys[next_index]
-                self.api_key = next_key
+                reordered_keys = list(self._api_keys)
+                failed_key = reordered_keys.pop(active_index)
+                reordered_keys.append(failed_key)
+                next_index = active_index if active_index < len(reordered_keys) - 1 else 0
+                serialized_api_keys = self._apply_api_key_state(
+                    reordered_keys,
+                    active_index=next_index,
+                )
+                if runtime_config is not None:
+                    runtime_config["api_key"] = serialized_api_keys
+                persisted = self._persist_api_keys_to_env(serialized_api_keys)
+                next_key = self.api_key or ""
                 log.warning(
-                    "[Custom] Key ...%s hit 402 Payment Required, switching to key ...%s (%s/%s) | reason=%s",
+                    "[Custom] Key ...%s hit 402 Payment Required, moved it to the end and switched to key ...%s (%s/%s) | persisted=%s | reason=%s",
                     self._mask_key_tail(failed_api_key),
                     self._mask_key_tail(next_key),
                     next_index + 1,
                     len(self._api_keys),
+                    persisted,
                     reason_preview,
                 )
                 return True
 
             self.api_key = active_key
+            if runtime_config is not None:
+                runtime_config["api_key"] = self.raw_api_key or self._serialize_api_keys(
+                    self._api_keys
+                )
             log.info(
                 "[Custom] Key ...%s hit 402 Payment Required, but active key is already ...%s; will retry with the current active key.",
                 self._mask_key_tail(failed_api_key),
@@ -1059,6 +1125,7 @@ class CustomModelClient:
                                 failed_index=api_key_index,
                                 total_keys=total_api_keys,
                                 reason_preview=combined_error_text[:1000],
+                                runtime_config=runtime_config,
                             )
                             if (
                                 rotated
