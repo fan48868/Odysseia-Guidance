@@ -503,6 +503,220 @@ class CustomModelClient:
         )
 
     @staticmethod
+    def _extract_text_from_openai_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+
+        if not isinstance(content, list):
+            return ""
+
+        text_chunks: List[str] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = str(block.get("type") or "").strip().lower()
+            block_text = block.get("text")
+            if isinstance(block_text, str) and (
+                not block_type or "text" in block_type
+            ):
+                normalized_text = block_text.strip()
+                if normalized_text:
+                    text_chunks.append(normalized_text)
+                continue
+
+            nested_content = block.get("content")
+            if isinstance(nested_content, str) and nested_content.strip():
+                text_chunks.append(nested_content.strip())
+
+        return "\n".join(text_chunks).strip()
+
+    @classmethod
+    def diagnose_streaming_chat_completion_body(cls, body: str) -> Dict[str, Any]:
+        normalized_body = str(body or "")
+        diagnostics: Dict[str, Any] = {
+            "body_length": len(normalized_body),
+            "body_is_empty": not bool(normalized_body.strip()),
+            "non_empty_line_count": 0,
+            "comment_line_count": 0,
+            "non_data_line_count": 0,
+            "data_line_count": 0,
+            "empty_data_line_count": 0,
+            "done_line_count": 0,
+            "json_payload_count": 0,
+            "json_decode_error_count": 0,
+            "error_payload_count": 0,
+            "choices_payload_count": 0,
+            "delta_content_chunk_count": 0,
+            "message_content_chunk_count": 0,
+            "reasoning_chunk_count": 0,
+            "tool_call_chunk_count": 0,
+            "response_id": None,
+            "model": None,
+            "latest_finish_reason": None,
+            "data_line_samples": [],
+            "non_data_line_samples": [],
+            "first_json_error": None,
+            "first_error_payload": None,
+        }
+
+        for line_number, raw_line in enumerate(normalized_body.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            diagnostics["non_empty_line_count"] += 1
+
+            if line.startswith(":"):
+                diagnostics["comment_line_count"] += 1
+                continue
+
+            if not line.startswith("data:"):
+                diagnostics["non_data_line_count"] += 1
+                if len(diagnostics["non_data_line_samples"]) < 5:
+                    diagnostics["non_data_line_samples"].append(
+                        {"line": line_number, "sample": cls._build_sse_log_sample(line)}
+                    )
+                continue
+
+            diagnostics["data_line_count"] += 1
+
+            payload_str = line[5:].strip()
+            if not payload_str:
+                diagnostics["empty_data_line_count"] += 1
+                continue
+
+            if payload_str == "[DONE]":
+                diagnostics["done_line_count"] += 1
+                continue
+
+            if len(diagnostics["data_line_samples"]) < 5:
+                diagnostics["data_line_samples"].append(
+                    {"line": line_number, "sample": cls._build_sse_log_sample(line)}
+                )
+
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError as exc:
+                diagnostics["json_decode_error_count"] += 1
+                if diagnostics["first_json_error"] is None:
+                    diagnostics["first_json_error"] = {
+                        "line": line_number,
+                        "message": exc.msg,
+                        "column": exc.colno,
+                        "sample": cls._build_sse_log_sample(line),
+                    }
+                continue
+
+            diagnostics["json_payload_count"] += 1
+
+            if not isinstance(payload, dict):
+                continue
+
+            if diagnostics["response_id"] is None and isinstance(payload.get("id"), str):
+                diagnostics["response_id"] = payload["id"]
+            if diagnostics["model"] is None and isinstance(payload.get("model"), str):
+                diagnostics["model"] = payload["model"]
+
+            error_payload = payload.get("error")
+            if error_payload is not None:
+                diagnostics["error_payload_count"] += 1
+                if diagnostics["first_error_payload"] is None:
+                    diagnostics["first_error_payload"] = error_payload
+
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            diagnostics["choices_payload_count"] += 1
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                continue
+
+            finish_reason = first_choice.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                diagnostics["latest_finish_reason"] = finish_reason
+
+            delta = first_choice.get("delta")
+            if isinstance(delta, dict):
+                if cls._extract_text_from_openai_content(delta.get("content")):
+                    diagnostics["delta_content_chunk_count"] += 1
+                if cls._extract_text_from_openai_content(
+                    delta.get("reasoning_content")
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+                elif (
+                    isinstance(delta.get("reasoning_content"), str)
+                    and delta["reasoning_content"].strip()
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+
+                delta_tool_calls = delta.get("tool_calls")
+                if isinstance(delta_tool_calls, list) and delta_tool_calls:
+                    diagnostics["tool_call_chunk_count"] += len(delta_tool_calls)
+
+            message_block = first_choice.get("message")
+            if isinstance(message_block, dict):
+                if cls._extract_text_from_openai_content(message_block.get("content")):
+                    diagnostics["message_content_chunk_count"] += 1
+                if cls._extract_text_from_openai_content(
+                    message_block.get("reasoning_content")
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+                elif (
+                    isinstance(message_block.get("reasoning_content"), str)
+                    and message_block["reasoning_content"].strip()
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+
+                message_tool_calls = message_block.get("tool_calls")
+                if isinstance(message_tool_calls, list) and message_tool_calls:
+                    diagnostics["tool_call_chunk_count"] += len(message_tool_calls)
+
+        return diagnostics
+
+    @classmethod
+    def explain_streaming_chat_completion_parse_failure(
+        cls, body: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        diagnostics = cls.diagnose_streaming_chat_completion_body(body)
+
+        if diagnostics["body_is_empty"]:
+            return "response body is empty", diagnostics
+        if diagnostics["data_line_count"] == 0:
+            return "response body does not contain any SSE data lines", diagnostics
+        if (
+            diagnostics["json_payload_count"] == 0
+            and diagnostics["json_decode_error_count"] > 0
+        ):
+            return "all SSE data lines failed JSON decoding", diagnostics
+        if (
+            diagnostics["done_line_count"] > 0
+            and diagnostics["choices_payload_count"] == 0
+        ):
+            return "stream ended with [DONE] before any assistant payload arrived", diagnostics
+        if (
+            diagnostics["error_payload_count"] > 0
+            and diagnostics["choices_payload_count"] == 0
+        ):
+            return "SSE payload only contained upstream error objects", diagnostics
+        if diagnostics["choices_payload_count"] == 0:
+            return "no SSE payload contained a non-empty choices array", diagnostics
+        if (
+            diagnostics["delta_content_chunk_count"] == 0
+            and diagnostics["message_content_chunk_count"] == 0
+            and diagnostics["reasoning_chunk_count"] == 0
+            and diagnostics["tool_call_chunk_count"] == 0
+        ):
+            return (
+                "choices were present but no content, reasoning_content, or tool_calls could be reconstructed",
+                diagnostics,
+            )
+        return "stream body format was not recognized by the parser", diagnostics
+
+    @staticmethod
     def _build_moonshot_image_payload_from_pil(image: Image.Image) -> Dict[str, Any]:
         """将 PIL 图片转换为 Moonshot 识别所需 payload。"""
         mime_type = "image/webp"
@@ -882,10 +1096,26 @@ class CustomModelClient:
                 delta_content = delta.get("content")
                 if isinstance(delta_content, str):
                     content_chunks.append(delta_content)
+                elif isinstance(delta_content, list):
+                    extracted_delta_content = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            delta_content
+                        )
+                    )
+                    if extracted_delta_content:
+                        content_chunks.append(extracted_delta_content)
 
                 delta_reasoning = delta.get("reasoning_content")
                 if isinstance(delta_reasoning, str):
                     reasoning_chunks.append(delta_reasoning)
+                elif isinstance(delta_reasoning, list):
+                    extracted_delta_reasoning = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            delta_reasoning
+                        )
+                    )
+                    if extracted_delta_reasoning:
+                        reasoning_chunks.append(extracted_delta_reasoning)
 
                 delta_tool_calls = delta.get("tool_calls")
                 if isinstance(delta_tool_calls, list):
@@ -900,6 +1130,14 @@ class CustomModelClient:
                 message_content = message_block.get("content")
                 if isinstance(message_content, str) and message_content and not content_chunks:
                     content_chunks.append(message_content)
+                elif isinstance(message_content, list) and not content_chunks:
+                    extracted_message_content = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            message_content
+                        )
+                    )
+                    if extracted_message_content:
+                        content_chunks.append(extracted_message_content)
 
                 message_reasoning = message_block.get("reasoning_content")
                 if (
@@ -908,6 +1146,14 @@ class CustomModelClient:
                     and not reasoning_chunks
                 ):
                     reasoning_chunks.append(message_reasoning)
+                elif isinstance(message_reasoning, list) and not reasoning_chunks:
+                    extracted_message_reasoning = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            message_reasoning
+                        )
+                    )
+                    if extracted_message_reasoning:
+                        reasoning_chunks.append(extracted_message_reasoning)
 
                 message_tool_calls = message_block.get("tool_calls")
                 if isinstance(message_tool_calls, list):

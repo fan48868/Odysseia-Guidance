@@ -179,6 +179,40 @@ class OpenAIService:
             "request_url": str(getattr(req, "url", "<none>")) if req else "<none>",
         }
 
+    def _log_custom_stream_parse_failure(
+        self,
+        *,
+        log_prefix: str,
+        response: httpx.Response,
+        used_api_url: str,
+        response_text: str,
+    ) -> None:
+        reason, diagnostics = (
+            self.custom_model_client.explain_streaming_chat_completion_parse_failure(
+                response_text
+            )
+        )
+        content_type = response.headers.get("content-type", "<none>")
+        server = response.headers.get("server", "<none>")
+        response_url = used_api_url or str(getattr(response.request, "url", "<none>"))
+        diagnostics_json = json.dumps(diagnostics, ensure_ascii=False)
+
+        log.error(
+            "[%s] Failed to parse streaming response | reason=%s | status=%s | content_type=%s | server=%s | url=%s | diagnostics=%s",
+            log_prefix,
+            reason,
+            response.status_code,
+            content_type,
+            server,
+            response_url,
+            diagnostics_json,
+        )
+        log.error(
+            "[%s] Full streaming response body:\n%s",
+            log_prefix,
+            response_text if response_text else "<empty>",
+        )
+
     @staticmethod
     def _apply_blacklist_notice(
         response: str, blacklist_punishment_active: bool
@@ -375,12 +409,16 @@ class OpenAIService:
             if is_custom_model and self.custom_model_client.is_sse_chat_completion_response(
                 response
             ):
+                response_text = response.text or ""
                 result = self.custom_model_client.parse_streaming_chat_completion_body(
-                    response.text or ""
+                    response_text
                 )
                 if not result:
-                    log.error(
-                        "[Custom Simple] 流式响应解析失败：无法从 SSE 数据中重建有效消息。"
+                    self._log_custom_stream_parse_failure(
+                        log_prefix="Custom Simple",
+                        response=response,
+                        used_api_url=used_api_url,
+                        response_text=response_text,
                     )
                     return None
 
@@ -1394,12 +1432,16 @@ class OpenAIService:
                 if is_custom_model and self.custom_model_client.is_sse_chat_completion_response(
                     response
                 ):
+                    response_text = response.text or ""
                     result = self.custom_model_client.parse_streaming_chat_completion_body(
-                        response.text or ""
+                        response_text
                     )
                     if not result:
-                        log.error(
-                            "[Custom] 流式响应解析失败：无法从 SSE 数据中重建有效消息。"
+                        self._log_custom_stream_parse_failure(
+                            log_prefix="Custom",
+                            response=response,
+                            used_api_url=used_api_url,
+                            response_text=response_text,
                         )
                         return self._apply_blacklist_notice(
                             "custom 通道返回了无法解析的流式响应，请稍后再试。",
