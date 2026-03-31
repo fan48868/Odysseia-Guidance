@@ -13,13 +13,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from PIL import Image
+from dotenv import set_key
 
+from src import config
 from src.chat.services.moonshot_vision_service import moonshot_vision_service
+from src.chat.utils.custom_model_api_keys import (
+    get_custom_model_api_key_raw_value,
+    persist_custom_model_api_keys_to_file,
+    resolve_custom_model_api_keys,
+    serialize_custom_model_api_keys,
+    split_custom_model_inline_api_keys,
+)
 
 log = logging.getLogger(__name__)
 
 
 class CustomModelClient:
+    _PRIMARY_API_KEY_ENV_NAME = "CUSTOM_MODEL_API_KEY"
+    _LEGACY_API_KEY_ENV_NAME = "CUSTON_MODEL_API_KEY"
     """Custom OpenAI 兼容通道客户端：负责配置管理、请求发送与 Custom 专属解析。"""
 
     def __init__(self) -> None:
@@ -28,7 +39,10 @@ class CustomModelClient:
         self._key_rotation_lock = asyncio.Lock()
         self._provider_order_rotation_lock = asyncio.Lock()
         self._provider_order_offset_by_model: Dict[str, int] = {}
+        self.api_key: Optional[str] = None
         self.raw_api_key: Optional[str] = None
+        self._api_key_source_type = "inline"
+        self._api_key_file_path: Optional[str] = None
         self._gateway_options_log_once: set[str] = set()
         runtime_config = self.refresh_from_env()
 
@@ -79,22 +93,7 @@ class CustomModelClient:
 
     @staticmethod
     def _split_api_keys(raw_api_keys: Optional[str]) -> List[str]:
-        raw = str(raw_api_keys or "").strip()
-        if not raw:
-            return []
-
-        parts = re.split(r"[,\n\r\uFF0C]+", raw)
-        normalized: List[str] = []
-        seen = set()
-
-        for part in parts:
-            key = part.strip().strip('"').strip("'").strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            normalized.append(key)
-
-        return normalized
+        return list(split_custom_model_inline_api_keys(raw_api_keys))
 
     @staticmethod
     def _mask_key_tail(api_key: Optional[str]) -> str:
@@ -103,38 +102,136 @@ class CustomModelClient:
         return api_key[-4:]
 
     @staticmethod
+    def _serialize_api_keys(api_keys: List[str]) -> str:
+        return serialize_custom_model_api_keys(api_keys)
+
+    @staticmethod
+    def _get_env_path() -> str:
+        return os.path.join(config.BASE_DIR, ".env")
+
+    def _apply_api_key_state(
+        self,
+        api_keys: List[str],
+        *,
+        active_index: int = 0,
+        raw_api_key_source: Optional[str] = None,
+        source_type: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> str:
+        normalized_keys = self._split_api_keys(self._serialize_api_keys(api_keys))
+        serialized_api_keys = self._serialize_api_keys(normalized_keys)
+        self._api_keys = normalized_keys
+
+        if raw_api_key_source is not None:
+            normalized_source = str(raw_api_key_source or "").strip()
+            self.raw_api_key = normalized_source or None
+        elif self.raw_api_key is None:
+            self.raw_api_key = serialized_api_keys or None
+
+        if source_type is not None:
+            normalized_source_type = str(source_type or "").strip().lower()
+            self._api_key_source_type = normalized_source_type or "inline"
+
+        if file_path is not None:
+            normalized_file_path = str(file_path or "").strip()
+            self._api_key_file_path = normalized_file_path or None
+
+        if not normalized_keys:
+            self._active_api_key_index = 0
+            self.api_key = None
+            return serialized_api_keys
+
+        normalized_index = min(max(active_index, 0), len(normalized_keys) - 1)
+        self._active_api_key_index = normalized_index
+        self.api_key = normalized_keys[normalized_index]
+        return serialized_api_keys
+
+    @classmethod
+    def _persist_api_keys_to_env(cls, serialized_api_keys: str) -> bool:
+        os.environ[cls._PRIMARY_API_KEY_ENV_NAME] = serialized_api_keys
+        if cls._LEGACY_API_KEY_ENV_NAME in os.environ:
+            os.environ[cls._LEGACY_API_KEY_ENV_NAME] = serialized_api_keys
+
+        env_path = cls._get_env_path()
+        try:
+            os.makedirs(os.path.dirname(env_path), exist_ok=True)
+            set_key(
+                env_path,
+                cls._PRIMARY_API_KEY_ENV_NAME,
+                serialized_api_keys,
+                quote_mode="always",
+                encoding="utf-8",
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "[Custom] Failed to persist %s to .env: %s",
+                cls._PRIMARY_API_KEY_ENV_NAME,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
     def _is_payment_required_error(
         status_code: int, combined_error_text: str
     ) -> bool:
         lowered_error_text = str(combined_error_text or "").lower()
         return status_code == 402 or "402 payment required" in lowered_error_text
 
-    def _sync_api_key_state(self, raw_api_key: Optional[str]) -> List[str]:
-        keys = self._split_api_keys(raw_api_key)
+    def _sync_api_key_state(
+        self,
+        api_keys: List[str],
+        *,
+        raw_api_key_source: Optional[str] = None,
+        source_type: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> List[str]:
+        keys = self._split_api_keys(self._serialize_api_keys(api_keys))
         current_key: Optional[str] = None
+        normalized_source = str(raw_api_key_source or "").strip()
 
         if self._api_keys and 0 <= self._active_api_key_index < len(self._api_keys):
             current_key = self._api_keys[self._active_api_key_index]
 
-        self._api_keys = keys
-
         if not keys:
-            self._active_api_key_index = 0
-            self.api_key = None
-            return keys
+            self._apply_api_key_state(
+                [],
+                active_index=0,
+                raw_api_key_source=normalized_source or None,
+                source_type=source_type,
+                file_path=file_path,
+            )
+            return self._api_keys
+
+        if normalized_source and self.raw_api_key == normalized_source and self._api_keys:
+            reordered_keys = [key for key in self._api_keys if key in keys]
+            reordered_keys.extend(key for key in keys if key not in reordered_keys)
+            keys = reordered_keys
 
         if current_key in keys:
-            self._active_api_key_index = keys.index(current_key)
+            active_index = keys.index(current_key)
         else:
-            self._active_api_key_index = 0
+            active_index = 0
 
-        self.api_key = keys[self._active_api_key_index]
-        return keys
+        self._apply_api_key_state(
+            keys,
+            active_index=active_index,
+            raw_api_key_source=normalized_source or None,
+            source_type=source_type,
+            file_path=file_path,
+        )
+        return self._api_keys
 
     def _get_active_api_key_snapshot(
         self, runtime_config: Dict[str, Any]
     ) -> Tuple[str, int, int]:
-        keys = self._sync_api_key_state(runtime_config.get("api_key"))
+        keys = self._sync_api_key_state(
+            list(runtime_config.get("api_keys") or []),
+            raw_api_key_source=runtime_config.get("api_key_source_value"),
+            source_type=runtime_config.get("api_key_source_type"),
+            file_path=runtime_config.get("api_key_file_path"),
+        )
         if not keys:
             return "", 0, 0
 
@@ -151,6 +248,7 @@ class CustomModelClient:
         failed_index: int,
         total_keys: int,
         reason_preview: str,
+        runtime_config: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if total_keys <= 1:
             return False
@@ -165,21 +263,59 @@ class CustomModelClient:
             active_key = self._api_keys[active_index]
 
             if active_key == failed_api_key and active_index == failed_index:
-                next_index = (active_index + 1) % len(self._api_keys)
-                self._active_api_key_index = next_index
-                next_key = self._api_keys[next_index]
-                self.api_key = next_key
+                reordered_keys = list(self._api_keys)
+                failed_key = reordered_keys.pop(active_index)
+                reordered_keys.append(failed_key)
+                next_index = active_index if active_index < len(reordered_keys) - 1 else 0
+                serialized_api_keys = self._apply_api_key_state(
+                    reordered_keys,
+                    active_index=next_index,
+                )
+                if runtime_config is not None:
+                    runtime_config["api_key"] = serialized_api_keys
+                    runtime_config["api_keys"] = list(self._api_keys)
+                source_type = str(
+                    (runtime_config or {}).get("api_key_source_type")
+                    or self._api_key_source_type
+                ).lower()
+                if source_type == "file":
+                    file_path = str(
+                        (runtime_config or {}).get("api_key_file_path")
+                        or self._api_key_file_path
+                        or ""
+                    ).strip()
+                    try:
+                        persist_custom_model_api_keys_to_file(file_path, self._api_keys)
+                        persisted = True
+                        persist_note: Any = f"file:{file_path}"
+                    except Exception as exc:
+                        persisted = False
+                        persist_note = f"file_failed:{type(exc).__name__}"
+                        log.warning(
+                            "[Custom] Failed to persist rotated API key order to file %s: %s",
+                            file_path or "<empty>",
+                            exc,
+                            exc_info=True,
+                        )
+                else:
+                    persisted = self._persist_api_keys_to_env(serialized_api_keys)
+                    persist_note = persisted
+                next_key = self.api_key or ""
                 log.warning(
-                    "[Custom] Key ...%s hit 402 Payment Required, switching to key ...%s (%s/%s) | reason=%s",
+                    "[Custom] Key ...%s hit 402 Payment Required, moved it to the end and switched to key ...%s (%s/%s) | persisted=%s | reason=%s",
                     self._mask_key_tail(failed_api_key),
                     self._mask_key_tail(next_key),
                     next_index + 1,
                     len(self._api_keys),
+                    persist_note,
                     reason_preview,
                 )
                 return True
 
             self.api_key = active_key
+            if runtime_config is not None:
+                runtime_config["api_key"] = self._serialize_api_keys(self._api_keys)
+                runtime_config["api_keys"] = list(self._api_keys)
             log.info(
                 "[Custom] Key ...%s hit 402 Payment Required, but active key is already ...%s; will retry with the current active key.",
                 self._mask_key_tail(failed_api_key),
@@ -190,10 +326,24 @@ class CustomModelClient:
     @classmethod
     def get_runtime_config(cls) -> Dict[str, Any]:
         base_url = str(os.environ.get("CUSTOM_MODEL_URL", "") or "").strip()
-        api_key = (
-            str(os.environ.get("CUSTOM_MODEL_API_KEY", "") or "").strip()
-            or str(os.environ.get("CUSTON_MODEL_API_KEY", "") or "").strip()
+        raw_api_key = get_custom_model_api_key_raw_value(
+            primary_env_name=cls._PRIMARY_API_KEY_ENV_NAME,
+            legacy_env_name=cls._LEGACY_API_KEY_ENV_NAME,
         )
+        api_key_resolution_error: Optional[str] = None
+        resolved_api_keys: List[str] = []
+        api_key_source_type = "inline"
+        api_key_file_path: Optional[str] = None
+
+        try:
+            resolved_api_key_config = resolve_custom_model_api_keys(raw_api_key)
+            resolved_api_keys = list(resolved_api_key_config.api_keys)
+            api_key_source_type = resolved_api_key_config.source_type
+            api_key_file_path = resolved_api_key_config.file_path
+        except ValueError as exc:
+            api_key_resolution_error = str(exc)
+
+        api_key = cls._serialize_api_keys(resolved_api_keys)
         model_name = str(os.environ.get("CUSTOM_MODEL_NAME", "") or "").strip()
         enable_vision = cls._normalize_bool_flag(
             os.environ.get("CUSTOM_MODEL_ENABLE_VISION")
@@ -229,6 +379,11 @@ class CustomModelClient:
         return {
             "base_url": base_url,
             "api_key": api_key,
+            "api_keys": resolved_api_keys,
+            "api_key_source_type": api_key_source_type,
+            "api_key_source_value": raw_api_key,
+            "api_key_file_path": api_key_file_path,
+            "api_key_error": api_key_resolution_error,
             "model_name": model_name,
             "enable_vision": enable_vision,
             "enable_video_input": enable_video_input,
@@ -239,8 +394,14 @@ class CustomModelClient:
 
     def refresh_from_env(self) -> Dict[str, Any]:
         runtime_config = self.get_runtime_config()
-        self.raw_api_key = runtime_config["api_key"] or None
-        self._sync_api_key_state(self.raw_api_key)
+        effective_api_keys = self._sync_api_key_state(
+            list(runtime_config.get("api_keys") or []),
+            raw_api_key_source=runtime_config.get("api_key_source_value"),
+            source_type=runtime_config.get("api_key_source_type"),
+            file_path=runtime_config.get("api_key_file_path"),
+        )
+        runtime_config["api_keys"] = list(effective_api_keys)
+        runtime_config["api_key"] = self._serialize_api_keys(effective_api_keys)
         self.base_url = runtime_config["base_url"] or None
         self.model_name = runtime_config["model_name"] or None
         self.enable_vision = bool(runtime_config["enable_vision"])
@@ -435,6 +596,220 @@ class CustomModelClient:
             history=list(response.history),
             extensions=dict(response.extensions),
         )
+
+    @staticmethod
+    def _extract_text_from_openai_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+
+        if not isinstance(content, list):
+            return ""
+
+        text_chunks: List[str] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            block_type = str(block.get("type") or "").strip().lower()
+            block_text = block.get("text")
+            if isinstance(block_text, str) and (
+                not block_type or "text" in block_type
+            ):
+                normalized_text = block_text.strip()
+                if normalized_text:
+                    text_chunks.append(normalized_text)
+                continue
+
+            nested_content = block.get("content")
+            if isinstance(nested_content, str) and nested_content.strip():
+                text_chunks.append(nested_content.strip())
+
+        return "\n".join(text_chunks).strip()
+
+    @classmethod
+    def diagnose_streaming_chat_completion_body(cls, body: str) -> Dict[str, Any]:
+        normalized_body = str(body or "")
+        diagnostics: Dict[str, Any] = {
+            "body_length": len(normalized_body),
+            "body_is_empty": not bool(normalized_body.strip()),
+            "non_empty_line_count": 0,
+            "comment_line_count": 0,
+            "non_data_line_count": 0,
+            "data_line_count": 0,
+            "empty_data_line_count": 0,
+            "done_line_count": 0,
+            "json_payload_count": 0,
+            "json_decode_error_count": 0,
+            "error_payload_count": 0,
+            "choices_payload_count": 0,
+            "delta_content_chunk_count": 0,
+            "message_content_chunk_count": 0,
+            "reasoning_chunk_count": 0,
+            "tool_call_chunk_count": 0,
+            "response_id": None,
+            "model": None,
+            "latest_finish_reason": None,
+            "data_line_samples": [],
+            "non_data_line_samples": [],
+            "first_json_error": None,
+            "first_error_payload": None,
+        }
+
+        for line_number, raw_line in enumerate(normalized_body.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            diagnostics["non_empty_line_count"] += 1
+
+            if line.startswith(":"):
+                diagnostics["comment_line_count"] += 1
+                continue
+
+            if not line.startswith("data:"):
+                diagnostics["non_data_line_count"] += 1
+                if len(diagnostics["non_data_line_samples"]) < 5:
+                    diagnostics["non_data_line_samples"].append(
+                        {"line": line_number, "sample": cls._build_sse_log_sample(line)}
+                    )
+                continue
+
+            diagnostics["data_line_count"] += 1
+
+            payload_str = line[5:].strip()
+            if not payload_str:
+                diagnostics["empty_data_line_count"] += 1
+                continue
+
+            if payload_str == "[DONE]":
+                diagnostics["done_line_count"] += 1
+                continue
+
+            if len(diagnostics["data_line_samples"]) < 5:
+                diagnostics["data_line_samples"].append(
+                    {"line": line_number, "sample": cls._build_sse_log_sample(line)}
+                )
+
+            try:
+                payload = json.loads(payload_str)
+            except json.JSONDecodeError as exc:
+                diagnostics["json_decode_error_count"] += 1
+                if diagnostics["first_json_error"] is None:
+                    diagnostics["first_json_error"] = {
+                        "line": line_number,
+                        "message": exc.msg,
+                        "column": exc.colno,
+                        "sample": cls._build_sse_log_sample(line),
+                    }
+                continue
+
+            diagnostics["json_payload_count"] += 1
+
+            if not isinstance(payload, dict):
+                continue
+
+            if diagnostics["response_id"] is None and isinstance(payload.get("id"), str):
+                diagnostics["response_id"] = payload["id"]
+            if diagnostics["model"] is None and isinstance(payload.get("model"), str):
+                diagnostics["model"] = payload["model"]
+
+            error_payload = payload.get("error")
+            if error_payload is not None:
+                diagnostics["error_payload_count"] += 1
+                if diagnostics["first_error_payload"] is None:
+                    diagnostics["first_error_payload"] = error_payload
+
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            diagnostics["choices_payload_count"] += 1
+
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                continue
+
+            finish_reason = first_choice.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                diagnostics["latest_finish_reason"] = finish_reason
+
+            delta = first_choice.get("delta")
+            if isinstance(delta, dict):
+                if cls._extract_text_from_openai_content(delta.get("content")):
+                    diagnostics["delta_content_chunk_count"] += 1
+                if cls._extract_text_from_openai_content(
+                    delta.get("reasoning_content")
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+                elif (
+                    isinstance(delta.get("reasoning_content"), str)
+                    and delta["reasoning_content"].strip()
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+
+                delta_tool_calls = delta.get("tool_calls")
+                if isinstance(delta_tool_calls, list) and delta_tool_calls:
+                    diagnostics["tool_call_chunk_count"] += len(delta_tool_calls)
+
+            message_block = first_choice.get("message")
+            if isinstance(message_block, dict):
+                if cls._extract_text_from_openai_content(message_block.get("content")):
+                    diagnostics["message_content_chunk_count"] += 1
+                if cls._extract_text_from_openai_content(
+                    message_block.get("reasoning_content")
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+                elif (
+                    isinstance(message_block.get("reasoning_content"), str)
+                    and message_block["reasoning_content"].strip()
+                ):
+                    diagnostics["reasoning_chunk_count"] += 1
+
+                message_tool_calls = message_block.get("tool_calls")
+                if isinstance(message_tool_calls, list) and message_tool_calls:
+                    diagnostics["tool_call_chunk_count"] += len(message_tool_calls)
+
+        return diagnostics
+
+    @classmethod
+    def explain_streaming_chat_completion_parse_failure(
+        cls, body: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        diagnostics = cls.diagnose_streaming_chat_completion_body(body)
+
+        if diagnostics["body_is_empty"]:
+            return "response body is empty", diagnostics
+        if diagnostics["data_line_count"] == 0:
+            return "response body does not contain any SSE data lines", diagnostics
+        if (
+            diagnostics["json_payload_count"] == 0
+            and diagnostics["json_decode_error_count"] > 0
+        ):
+            return "all SSE data lines failed JSON decoding", diagnostics
+        if (
+            diagnostics["done_line_count"] > 0
+            and diagnostics["choices_payload_count"] == 0
+        ):
+            return "stream ended with [DONE] before any assistant payload arrived", diagnostics
+        if (
+            diagnostics["error_payload_count"] > 0
+            and diagnostics["choices_payload_count"] == 0
+        ):
+            return "SSE payload only contained upstream error objects", diagnostics
+        if diagnostics["choices_payload_count"] == 0:
+            return "no SSE payload contained a non-empty choices array", diagnostics
+        if (
+            diagnostics["delta_content_chunk_count"] == 0
+            and diagnostics["message_content_chunk_count"] == 0
+            and diagnostics["reasoning_chunk_count"] == 0
+            and diagnostics["tool_call_chunk_count"] == 0
+        ):
+            return (
+                "choices were present but no content, reasoning_content, or tool_calls could be reconstructed",
+                diagnostics,
+            )
+        return "stream body format was not recognized by the parser", diagnostics
 
     @staticmethod
     def _build_moonshot_image_payload_from_pil(image: Image.Image) -> Dict[str, Any]:
@@ -687,9 +1062,17 @@ class CustomModelClient:
         if runtime_config is None:
             runtime_config = self.refresh_from_env()
 
+        api_key_error = str(runtime_config.get("api_key_error", "") or "").strip()
+        if api_key_error:
+            log.warning(
+                "请求使用 custom 但 CUSTOM_MODEL_API_KEY 无法解析：%s",
+                api_key_error,
+            )
+            return api_key_error
+
         if (
             runtime_config["base_url"]
-            and runtime_config["api_key"]
+            and runtime_config.get("api_keys")
             and runtime_config["model_name"]
         ):
             return None
@@ -816,10 +1199,26 @@ class CustomModelClient:
                 delta_content = delta.get("content")
                 if isinstance(delta_content, str):
                     content_chunks.append(delta_content)
+                elif isinstance(delta_content, list):
+                    extracted_delta_content = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            delta_content
+                        )
+                    )
+                    if extracted_delta_content:
+                        content_chunks.append(extracted_delta_content)
 
                 delta_reasoning = delta.get("reasoning_content")
                 if isinstance(delta_reasoning, str):
                     reasoning_chunks.append(delta_reasoning)
+                elif isinstance(delta_reasoning, list):
+                    extracted_delta_reasoning = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            delta_reasoning
+                        )
+                    )
+                    if extracted_delta_reasoning:
+                        reasoning_chunks.append(extracted_delta_reasoning)
 
                 delta_tool_calls = delta.get("tool_calls")
                 if isinstance(delta_tool_calls, list):
@@ -834,6 +1233,14 @@ class CustomModelClient:
                 message_content = message_block.get("content")
                 if isinstance(message_content, str) and message_content and not content_chunks:
                     content_chunks.append(message_content)
+                elif isinstance(message_content, list) and not content_chunks:
+                    extracted_message_content = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            message_content
+                        )
+                    )
+                    if extracted_message_content:
+                        content_chunks.append(extracted_message_content)
 
                 message_reasoning = message_block.get("reasoning_content")
                 if (
@@ -842,6 +1249,14 @@ class CustomModelClient:
                     and not reasoning_chunks
                 ):
                     reasoning_chunks.append(message_reasoning)
+                elif isinstance(message_reasoning, list) and not reasoning_chunks:
+                    extracted_message_reasoning = (
+                        CustomModelClient._extract_text_from_openai_content(
+                            message_reasoning
+                        )
+                    )
+                    if extracted_message_reasoning:
+                        reasoning_chunks.append(extracted_message_reasoning)
 
                 message_tool_calls = message_block.get("tool_calls")
                 if isinstance(message_tool_calls, list):
@@ -1059,6 +1474,7 @@ class CustomModelClient:
                                 failed_index=api_key_index,
                                 total_keys=total_api_keys,
                                 reason_preview=combined_error_text[:1000],
+                                runtime_config=runtime_config,
                             )
                             if (
                                 rotated

@@ -26,7 +26,7 @@ class PersonalMemoryVectorService:
     - 当 embedding 不可用/失败时，尽量不破坏已有向量（避免把旧数据清空）
     """
 
-    MAX_ITEMS_PER_USER: int = 200
+    MAX_ITEMS_PER_USER: Optional[int] = None
 
     def parse_personal_summary(self, personal_summary: str) -> List[Dict[str, str]]:
         if not personal_summary or not personal_summary.strip():
@@ -87,7 +87,7 @@ class PersonalMemoryVectorService:
             seen.add(key)
             deduped.append(item)
 
-        if len(deduped) > self.MAX_ITEMS_PER_USER:
+        if self.MAX_ITEMS_PER_USER and len(deduped) > self.MAX_ITEMS_PER_USER:
             log.warning(
                 "personal_summary 解析出 %s 条记忆，超过上限 %s，将截断。",
                 len(deduped),

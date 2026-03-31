@@ -11,6 +11,10 @@ from src.chat.features.chat_settings.services.chat_settings_service import (
     chat_settings_service,
 )
 from src.chat.features.tools.tool_metadata import tool_metadata
+from src.chat.utils.custom_model_api_keys import (
+    get_custom_model_api_key_raw_value,
+    resolve_custom_model_api_keys,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,9 +109,7 @@ def _truncate_custom_credits(data: Any) -> Any:
 
 
 def _get_custom_api_key() -> str:
-    return (
-        os.getenv("CUSTOM_MODEL_API_KEY") or os.getenv("CUSTON_MODEL_API_KEY") or ""
-    ).strip()
+    return get_custom_model_api_key_raw_value()
 
 
 async def _get_current_model() -> str:
@@ -336,12 +338,12 @@ async def _get_moonshot_balance(
 
 
 async def _get_custom_gateway_balance(
-    current_model: str, log_detailed: bool = False
+    current_model: str,
+    custom_api_key: str,
+    log_detailed: bool = False,
 ) -> Dict[str, Any]:
     provider = "custom"
     endpoint = CUSTOM_GATEWAY_CREDITS_ENDPOINT
-    custom_api_key = _get_custom_api_key()
-
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -467,18 +469,19 @@ async def _query_custom_gateway_balance_with_key(
 
 
 async def _get_custom_gateway_balance_multi(
-    current_model: str, log_detailed: bool = False
+    current_model: str,
+    api_keys: List[str],
+    log_detailed: bool = False,
 ) -> Dict[str, Any]:
     provider = "custom"
     endpoint = CUSTOM_GATEWAY_CREDITS_ENDPOINT
-    api_keys = _split_api_keys(_get_custom_api_key())
 
     if not api_keys:
         return _build_payload(
             ok=False,
             provider=provider,
             model=current_model,
-            error="缺少环境变量 CUSTOM_MODEL_API_KEY，无法查询余额。",
+            error="缺少有效的 CUSTOM_MODEL_API_KEY，无法查询余额。",
         )
 
     if log_detailed:
@@ -549,11 +552,12 @@ async def _get_custom_gateway_balance_multi(
 
 
 async def _get_custom_siliconflow_balance(
-    current_model: str, log_detailed: bool = False
+    current_model: str,
+    custom_api_key: str,
+    log_detailed: bool = False,
 ) -> Dict[str, Any]:
     provider = "custom"
     endpoint = SILICONFLOW_USER_INFO_ENDPOINT
-    custom_api_key = _get_custom_api_key()
 
     headers = {
         "Accept": "application/json",
@@ -624,10 +628,9 @@ async def _get_custom_balance(
 ) -> Dict[str, Any]:
     provider = "custom"
     custom_model_url = (os.getenv("CUSTOM_MODEL_URL") or "").strip()
-    custom_api_key = _get_custom_api_key()
-    custom_api_keys = _split_api_keys(custom_api_key)
+    custom_api_key_source = _get_custom_api_key()
 
-    if not custom_model_url or not custom_api_key:
+    if not custom_model_url or not custom_api_key_source:
         return _build_payload(
             ok=False,
             provider=provider,
@@ -635,20 +638,42 @@ async def _get_custom_balance(
             error="缺少环境变量 CUSTOM_MODEL_URL / CUSTOM_MODEL_API_KEY，无法查询余额。",
         )
 
+    try:
+        resolved_custom_api_keys = resolve_custom_model_api_keys(custom_api_key_source)
+    except ValueError as exc:
+        return _build_payload(
+            ok=False,
+            provider=provider,
+            model=current_model,
+            error=str(exc),
+        )
+
+    custom_api_keys = list(resolved_custom_api_keys.api_keys)
+    if not custom_api_keys:
+        return _build_payload(
+            ok=False,
+            provider=provider,
+            model=current_model,
+            error="缺少有效的 CUSTOM_MODEL_API_KEY，无法查询余额。",
+        )
+
     if custom_model_url == CUSTOM_GATEWAY_BASE_URL:
         if len(custom_api_keys) > 1:
             return await _get_custom_gateway_balance_multi(
                 current_model=current_model,
+                api_keys=custom_api_keys,
                 log_detailed=log_detailed,
             )
         return await _get_custom_gateway_balance(
             current_model=current_model,
+            custom_api_key=custom_api_keys[0],
             log_detailed=log_detailed,
         )
 
     if custom_model_url == SILICONFLOW_BASE_URL:
         return await _get_custom_siliconflow_balance(
             current_model=current_model,
+            custom_api_key=custom_api_keys[0],
             log_detailed=log_detailed,
         )
 

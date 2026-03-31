@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 
 _LONG_TERM_HEADER = "### 长期记忆"
 _RECENT_HEADER = "### 近期动态"
+_MEMORY_PAGE_CHAR_LIMIT = 4000
+_MEMORY_PREVIEW_TIMEOUT = 300
 
 _BULLET_ITEM_RE = re.compile(r"^[-*•]\s*(.+)$")
 _NUMBERED_ITEM_RE = re.compile(r"^\d+[\.\、]\s*(.+)$")
@@ -54,6 +56,76 @@ def _build_empty_personal_summary() -> str:
 
 def _build_personal_summary_format_example() -> str:
     return f"{_LONG_TERM_HEADER}\n- 条目1\n{_RECENT_HEADER}\n- 条目1"
+
+
+def _prepare_memory_summary_for_view(raw_summary: str | None) -> str:
+    summary = raw_summary or ""
+    if summary.strip():
+        return summary
+    return _build_empty_personal_summary()
+
+
+def _split_memory_summary_into_pages(
+    summary: str,
+    max_chars: int = _MEMORY_PAGE_CHAR_LIMIT,
+) -> list[str]:
+    if max_chars <= 0:
+        raise ValueError("分页长度必须大于 0。")
+
+    if summary == "":
+        return [""]
+
+    pages: list[str] = []
+    current_chunks: list[str] = []
+    current_len = 0
+
+    for segment in summary.splitlines(keepends=True) or [summary]:
+        if len(segment) <= max_chars:
+            if current_len + len(segment) <= max_chars:
+                current_chunks.append(segment)
+                current_len += len(segment)
+            else:
+                if current_chunks:
+                    pages.append("".join(current_chunks))
+                current_chunks = [segment]
+                current_len = len(segment)
+            continue
+
+        if current_chunks:
+            pages.append("".join(current_chunks))
+            current_chunks = []
+            current_len = 0
+
+        start = 0
+        while start < len(segment):
+            chunk = segment[start : start + max_chars]
+            start += max_chars
+
+            if len(chunk) == max_chars:
+                pages.append(chunk)
+            else:
+                current_chunks = [chunk]
+                current_len = len(chunk)
+
+    if current_chunks or not pages:
+        pages.append("".join(current_chunks))
+
+    return pages
+
+
+def _replace_memory_page(
+    summary: str,
+    page_index: int,
+    new_page_text: str,
+    max_chars: int = _MEMORY_PAGE_CHAR_LIMIT,
+) -> str:
+    pages = _split_memory_summary_into_pages(summary, max_chars=max_chars)
+    if page_index < 0 or page_index >= len(pages):
+        raise IndexError("页码超出范围。")
+
+    updated_pages = list(pages)
+    updated_pages[page_index] = new_page_text
+    return "".join(updated_pages)
 
 
 def _validate_personal_summary_format(summary: str) -> None:
@@ -459,13 +531,16 @@ class UserEditMemoryModal(discord.ui.Modal, title="编辑个人记忆"):
         super().__init__()
         self.actor_user_id = actor_user_id
         self.target_user_id = target_user_id
-        
+
         # 截断过长的记忆以防止 API 报错 (Discord 限制为 4000 字符)
         default_value = current_memory
         warning_msg = None
-        if len(default_value) > 4000:
-            warning_msg = f"记忆摘要过长 ({len(default_value)} 字符)，已截断至 4000 字符。"
-            default_value = default_value[:4000]
+        if len(default_value) > _MEMORY_PAGE_CHAR_LIMIT:
+            warning_msg = (
+                f"记忆摘要过长 ({len(default_value)} 字符)，"
+                f"已截断至 {_MEMORY_PAGE_CHAR_LIMIT} 字符。"
+            )
+            default_value = default_value[:_MEMORY_PAGE_CHAR_LIMIT]
 
         self.memory_input = discord.ui.TextInput(
             label="个人记忆摘要",
@@ -473,7 +548,7 @@ class UserEditMemoryModal(discord.ui.Modal, title="编辑个人记忆"):
             placeholder="在这里输入你的个人记忆...",
             default=default_value,
             required=False,
-            max_length=4000, 
+            max_length=_MEMORY_PAGE_CHAR_LIMIT,
         )
         self.add_item(self.memory_input)
 
@@ -552,6 +627,297 @@ class RetryEditMemoryView(discord.ui.View):
     @discord.ui.button(label="重新填写", style=discord.ButtonStyle.primary, emoji="✏️")
     async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
         modal = UserEditMemoryModal(self.actor_user_id, self.target_user_id, self.draft_summary)
+        await interaction.response.send_modal(modal)
+
+
+class PagedMemoryPreviewView(discord.ui.View):
+    def __init__(
+        self,
+        actor_user_id: int,
+        target_user_id: int,
+        summary_snapshot: str,
+    ):
+        super().__init__(timeout=_MEMORY_PREVIEW_TIMEOUT)
+        self.actor_user_id = actor_user_id
+        self.target_user_id = target_user_id
+        self.summary_snapshot = summary_snapshot
+        self.pages = _split_memory_summary_into_pages(summary_snapshot)
+        self.current_page = 0
+        self.message: discord.Message | None = None
+
+        self.first_button = discord.ui.Button(
+            emoji="⏮️",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.first_button.callback = self.go_to_first_page
+        self.add_item(self.first_button)
+
+        self.prev_button = discord.ui.Button(
+            emoji="⏪",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.prev_button.callback = self.go_to_previous_page
+        self.add_item(self.prev_button)
+
+        self.edit_button = discord.ui.Button(
+            label="编辑当前",
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+        self.edit_button.callback = self.edit_current_page
+        self.add_item(self.edit_button)
+
+        self.next_button = discord.ui.Button(
+            emoji="⏩",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.next_button.callback = self.go_to_next_page
+        self.add_item(self.next_button)
+
+        self.last_button = discord.ui.Button(
+            emoji="⏭️",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.last_button.callback = self.go_to_last_page
+        self.add_item(self.last_button)
+
+        self._sync_button_state()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.actor_user_id:
+            return True
+        await interaction.response.send_message("❌ 这不是你的操作面板。", ephemeral=True)
+        return False
+
+    def _sync_button_state(self) -> None:
+        total_pages = len(self.pages)
+        is_first_page = self.current_page <= 0
+        is_last_page = self.current_page >= total_pages - 1
+
+        self.first_button.disabled = is_first_page
+        self.prev_button.disabled = is_first_page
+        self.next_button.disabled = is_last_page
+        self.last_button.disabled = is_last_page
+        self.edit_button.disabled = total_pages <= 0
+
+    def _clamp_page_index(self) -> None:
+        if not self.pages:
+            self.pages = [""]
+        self.current_page = max(0, min(self.current_page, len(self.pages) - 1))
+
+    def build_embed(self) -> discord.Embed:
+        self._clamp_page_index()
+        self._sync_button_state()
+
+        page_text = self.pages[self.current_page]
+        embed = discord.Embed(
+            title="个人记忆分页预览",
+            description=page_text or "\u200b",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(
+            text=(
+                f"第 {self.current_page + 1} / {len(self.pages)} 页"
+                f" | 本页 {len(page_text)} 字符"
+                f" | 全文 {len(self.summary_snapshot)} 字符"
+            )
+        )
+        return embed
+
+    async def update_message(self) -> None:
+        self._clamp_page_index()
+        self._sync_button_state()
+        if self.message is None:
+            return
+        await self.message.edit(embed=self.build_embed(), view=self)
+
+    async def refresh_summary(self, new_summary: str) -> None:
+        self.summary_snapshot = new_summary
+        self.pages = _split_memory_summary_into_pages(new_summary)
+        self._clamp_page_index()
+        await self.update_message()
+
+    async def go_to_first_page(self, interaction: discord.Interaction) -> None:
+        self.current_page = 0
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def go_to_previous_page(self, interaction: discord.Interaction) -> None:
+        if self.current_page > 0:
+            self.current_page -= 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def edit_current_page(self, interaction: discord.Interaction) -> None:
+        self._clamp_page_index()
+        modal = EditMemoryPageModal(
+            preview_view=self,
+            page_index=self.current_page,
+            summary_snapshot=self.summary_snapshot,
+            current_page_text=self.pages[self.current_page],
+        )
+        await interaction.response.send_modal(modal)
+
+    async def go_to_next_page(self, interaction: discord.Interaction) -> None:
+        if self.current_page < len(self.pages) - 1:
+            self.current_page += 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def go_to_last_page(self, interaction: discord.Interaction) -> None:
+        self.current_page = len(self.pages) - 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                log.debug("分页记忆预览超时后禁用按钮失败。", exc_info=True)
+
+
+class EditMemoryPageModal(discord.ui.Modal):
+    def __init__(
+        self,
+        preview_view: PagedMemoryPreviewView,
+        page_index: int,
+        summary_snapshot: str,
+        current_page_text: str,
+    ):
+        super().__init__(title=f"编辑当前页（第 {page_index + 1} 页）")
+        self.preview_view = preview_view
+        self.actor_user_id = preview_view.actor_user_id
+        self.target_user_id = preview_view.target_user_id
+        self.page_index = page_index
+        self.summary_snapshot = summary_snapshot
+
+        self.page_input = discord.ui.TextInput(
+            label="当前页记忆",
+            style=discord.TextStyle.paragraph,
+            default=current_page_text,
+            required=False,
+            max_length=_MEMORY_PAGE_CHAR_LIMIT,
+        )
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.user or interaction.user.id != self.actor_user_id:
+            await interaction.response.send_message("❌ 这不是你的操作面板。", ephemeral=True)
+            return
+        if not _can_manage_memory(self.actor_user_id, self.target_user_id):
+            await interaction.response.send_message("❌ 你没有权限修改该用户的记忆。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        latest_summary_raw = await _get_personal_summary_raw(self.target_user_id)
+        latest_summary = latest_summary_raw or ""
+        if latest_summary != self.summary_snapshot:
+            await interaction.followup.send(
+                "❌ 当前记忆已被其他操作改动，请重新打开分页预览后再编辑。",
+                ephemeral=True,
+            )
+            return
+
+        draft_page = self.page_input.value or ""
+
+        try:
+            new_summary = _replace_memory_page(
+                summary=self.summary_snapshot,
+                page_index=self.page_index,
+                new_page_text=draft_page,
+            )
+            _validate_personal_summary_format(new_summary)
+            _validate_personal_summary_items_bulleted(new_summary)
+        except (IndexError, ValueError) as e:
+            view = RetryEditMemoryPageView(
+                preview_view=self.preview_view,
+                page_index=self.page_index,
+                summary_snapshot=self.summary_snapshot,
+                draft_page_text=draft_page,
+            )
+            await interaction.followup.send(
+                f"❌ 当前页修改会破坏整份记忆格式：{e}\n\n正确格式示例：\n```text\n{_build_personal_summary_format_example()}\n```",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await _apply_personal_summary_update_with_vector_sync(
+                user_id=self.target_user_id,
+                old_summary=latest_summary_raw,
+                new_summary=new_summary,
+            )
+        except Exception as e:
+            view = RetryEditMemoryPageView(
+                preview_view=self.preview_view,
+                page_index=self.page_index,
+                summary_snapshot=self.summary_snapshot,
+                draft_page_text=draft_page,
+            )
+            log.error(
+                "用户 %s 分页编辑用户 %s 的记忆失败（已回滚）: %s",
+                self.actor_user_id,
+                self.target_user_id,
+                e,
+                exc_info=True,
+            )
+            await interaction.followup.send(
+                f"❌ 向量同步失败，当前页修改未生效（已回滚）。\n错误：{e}",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        success_message = "✅ 当前页已成功更新，分页预览已刷新。"
+        try:
+            await self.preview_view.refresh_summary(new_summary)
+        except Exception as refresh_err:
+            success_message = "✅ 当前页已成功更新，但预览刷新失败，请重新打开分页预览查看。"
+            log.warning(
+                "分页记忆预览刷新失败: actor_user_id=%s, target_user_id=%s, err=%s",
+                self.actor_user_id,
+                self.target_user_id,
+                refresh_err,
+                exc_info=True,
+            )
+
+        await interaction.followup.send(success_message, ephemeral=True)
+
+
+class RetryEditMemoryPageView(discord.ui.View):
+    def __init__(
+        self,
+        preview_view: PagedMemoryPreviewView,
+        page_index: int,
+        summary_snapshot: str,
+        draft_page_text: str,
+    ):
+        super().__init__(timeout=120)
+        self.preview_view = preview_view
+        self.actor_user_id = preview_view.actor_user_id
+        self.page_index = page_index
+        self.summary_snapshot = summary_snapshot
+        self.draft_page_text = draft_page_text
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user and interaction.user.id == self.actor_user_id:
+            return True
+        await interaction.response.send_message("❌ 这不是你的操作面板。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="重新编辑当前页", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = EditMemoryPageModal(
+            preview_view=self.preview_view,
+            page_index=self.page_index,
+            summary_snapshot=self.summary_snapshot,
+            current_page_text=self.draft_page_text,
+        )
         await interaction.response.send_modal(modal)
 
 
@@ -960,17 +1326,35 @@ class MemoryView(discord.ui.View):
 
     @discord.ui.button(label="查看并修改记忆", style=discord.ButtonStyle.success, emoji="🧠")
     async def edit_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 点击按钮后弹出模态框
         if not _can_manage_memory(self.actor_user_id, self.target_user_id):
             await interaction.response.send_message("❌ 你没有权限修改该用户的记忆。", ephemeral=True)
             return
+
         current_summary_raw = await _get_personal_summary_raw(self.target_user_id)
-        current_memory = current_summary_raw or ""
-        if not current_memory.strip():
-            current_memory = _build_empty_personal_summary()
+        current_memory = _prepare_memory_summary_for_view(current_summary_raw)
         self.current_memory = current_memory
         self.current_summary_raw = current_summary_raw
-        modal = UserEditMemoryModal(self.actor_user_id, self.target_user_id, self.current_memory)
+
+        if len(current_memory) > _MEMORY_PAGE_CHAR_LIMIT:
+            preview_view = PagedMemoryPreviewView(
+                actor_user_id=self.actor_user_id,
+                target_user_id=self.target_user_id,
+                summary_snapshot=current_memory,
+            )
+            await interaction.response.send_message(
+                content="记忆摘要超过 4000 字符，已切换为分页预览。",
+                embed=preview_view.build_embed(),
+                view=preview_view,
+                ephemeral=True,
+            )
+            preview_view.message = await interaction.original_response()
+            return
+
+        modal = UserEditMemoryModal(
+            self.actor_user_id,
+            self.target_user_id,
+            self.current_memory,
+        )
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="切换用户", style=discord.ButtonStyle.primary, emoji="🔁")
@@ -1039,9 +1423,7 @@ class SwitchUserModal(discord.ui.Modal, title="切换用户"):
             return
 
         current_summary_raw = await _get_personal_summary_raw(target_user_id)
-        current_memory = current_summary_raw or ""
-        if not current_memory.strip():
-            current_memory = _build_empty_personal_summary()
+        current_memory = _prepare_memory_summary_for_view(current_summary_raw)
 
         self.parent_view.target_user_id = target_user_id
         self.parent_view.current_memory = current_memory
@@ -1062,11 +1444,9 @@ class MemoryCommands(commands.Cog):
     # async def view_and_edit_memory(self, interaction: discord.Interaction):
     #     user_id = interaction.user.id
         
-    #     try:
-    #         current_summary_raw = await _get_personal_summary_raw(user_id)
-    #         current_summary = current_summary_raw or ""
-    #         if not current_summary.strip():
-    #             current_summary = _build_empty_personal_summary()
+        try:
+            current_summary_raw = await _get_personal_summary_raw(user_id)
+            current_summary = _prepare_memory_summary_for_view(current_summary_raw)
                 
     #         view = MemoryView(
     #             actor_user_id=user_id,

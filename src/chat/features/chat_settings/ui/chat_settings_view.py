@@ -566,6 +566,7 @@ class ChatSettingsView(View):
                         f"- 记忆摘要模型: `{normalized_summary_model}`\n"
                         f"- 摘要模型持久化: {summary_persist_note}\n"
                         "可以配置 `CUSTOM_MODEL_URL` / `CUSTOM_MODEL_API_KEY` / `CUSTOM_MODEL_NAME`。\n"
+                        "`CUSTOM_MODEL_API_KEY` 支持直接填写 key，或填写 `/data/*.json` 文件路径（会自动映射到 `/app/data`）。\n"
                         "点击下方按钮打开配置窗口（默认值将从项目根目录 `.env` 读取）。"
                     ),
                     view=view,

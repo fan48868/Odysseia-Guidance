@@ -10,12 +10,15 @@ from discord.ui import TextInput
 class CustomModelConfigModal(discord.ui.Modal):
     """配置 custom(OpenAI 兼容) 模型所需的环境变量。"""
 
+    API_KEY_INPUT_MAX_LENGTH = 4000
+
     def __init__(
         self,
         *,
         title: str,
         current_url: str,
         current_api_key: str,
+        current_api_key_omitted: bool,
         current_model_name: str,
         current_enable_vision: str,
         current_enable_video_input: str,
@@ -23,6 +26,12 @@ class CustomModelConfigModal(discord.ui.Modal):
     ):
         super().__init__(title=title)
         self.on_submit_callback = on_submit_callback
+
+        api_key_placeholder = (
+            "当前 inline key 过长未展示；留空表示保持不变，也可填 /data/*.json（会自动映射）"
+            if current_api_key_omitted
+            else "例如：sk-xxxx / vck_xxxx / /data/CUSTOM_MODEL_API_KEY.json；留空保持当前值"
+        )
 
         self.url_input = TextInput(
             label="CUSTOM_MODEL_URL",
@@ -34,10 +43,11 @@ class CustomModelConfigModal(discord.ui.Modal):
         )
         self.api_key_input = TextInput(
             label="CUSTOM_MODEL_API_KEY",
-            placeholder="例如：sk-xxxx / vck_xxxx",
+            placeholder=api_key_placeholder,
             default=current_api_key or "",
-            required=True,
-            max_length=500,
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=self.API_KEY_INPUT_MAX_LENGTH,
             custom_id="custom_model_api_key",
         )
         self.model_name_input = TextInput(

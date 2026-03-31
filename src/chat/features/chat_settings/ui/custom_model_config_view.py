@@ -17,6 +17,10 @@ from src.chat.features.chat_settings.ui.custom_model_config_modal import (
 )
 from src.chat.services.gemini_service import gemini_service
 from src.chat.services.openai_models import CustomModelClient
+from src.chat.utils.custom_model_api_keys import (
+    get_custom_model_api_key_raw_value,
+    resolve_custom_model_api_keys,
+)
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +78,7 @@ class CustomModelConfigView(View):
             return str(os.environ.get(key, "") or "").strip()
 
         url = _pick("CUSTOM_MODEL_URL")
-        api_key = _pick("CUSTOM_MODEL_API_KEY") or _pick("CUSTON_MODEL_API_KEY")
+        api_key = get_custom_model_api_key_raw_value()
         model_name = _pick("CUSTOM_MODEL_NAME")
         enable_vision = (
             cls._normalize_bool_value(_pick("CUSTOM_MODEL_ENABLE_VISION")) or "false"
@@ -149,10 +153,16 @@ class CustomModelConfigView(View):
         url, api_key, model_name, enable_vision, enable_video_input = (
             self._read_custom_model_env()
         )
+        api_key_default_value = api_key
+        api_key_omitted = False
+        if len(api_key_default_value) > CustomModelConfigModal.API_KEY_INPUT_MAX_LENGTH:
+            api_key_default_value = ""
+            api_key_omitted = True
 
         async def _on_submit(modal_interaction: Interaction, settings: Dict[str, Any]):
             new_url = str(settings.get("custom_model_url", "")).strip()
-            new_key = str(settings.get("custom_model_api_key", "")).strip()
+            submitted_key = str(settings.get("custom_model_api_key", "")).strip()
+            effective_key = submitted_key or api_key
             new_name = str(settings.get("custom_model_name", "")).strip()
             vision_raw = str(settings.get("custom_model_enable_vision", "")).strip()
             video_input_raw = str(
@@ -185,22 +195,33 @@ class CustomModelConfigView(View):
                 )
                 return
 
-            if not new_url or not new_key or not new_name:
+            if not new_url or not effective_key or not new_name:
                 await modal_interaction.response.send_message(
                     "❌ CUSTOM_MODEL_URL / CUSTOM_MODEL_API_KEY / CUSTOM_MODEL_NAME 不能为空。",
                     ephemeral=True,
                 )
                 return
 
+            try:
+                resolved_key_config = resolve_custom_model_api_keys(effective_key)
+            except ValueError as exc:
+                await modal_interaction.response.send_message(
+                    f"❌ {str(exc)}",
+                    ephemeral=True,
+                )
+                return
+
             os.environ["CUSTOM_MODEL_URL"] = new_url
-            os.environ["CUSTOM_MODEL_API_KEY"] = new_key
+            os.environ["CUSTOM_MODEL_API_KEY"] = effective_key
             os.environ["CUSTOM_MODEL_NAME"] = new_name
             os.environ["CUSTOM_MODEL_ENABLE_VISION"] = new_enable_vision
             os.environ["CUSTOM_MODEL_ENABLE_VIDEO_INPUT"] = new_enable_video_input
+            if "CUSTON_MODEL_API_KEY" in os.environ:
+                os.environ["CUSTON_MODEL_API_KEY"] = effective_key
 
             persisted = self._persist_custom_model_env(
                 url=new_url,
-                api_key=new_key,
+                api_key=effective_key,
                 model_name=new_name,
                 enable_vision=new_enable_vision,
                 enable_video_input=new_enable_video_input,
@@ -220,12 +241,26 @@ class CustomModelConfigView(View):
             video_input_note = (
                 "✅ 开启" if new_enable_video_input == "true" else "❌ 关闭"
             )
+            if resolved_key_config.source_type == "file":
+                api_key_source_note = (
+                    f"文件 `{resolved_key_config.file_path}`（从文件读取到 {resolved_key_config.key_count} 个 key）"
+                )
+                api_key_preview_note = None
+            else:
+                api_key_source_note = f"inline（解析到 {resolved_key_config.key_count} 个 key）"
+                first_key = resolved_key_config.api_keys[0] if resolved_key_config.api_keys else ""
+                api_key_preview_note = (
+                    f"- API Key 预览: `{self._mask_key(first_key)}`\n"
+                    if first_key
+                    else ""
+                )
             await modal_interaction.response.send_message(
                 (
                     "✅ 已更新 custom 模型配置并生效。\n"
                     f"- URL: `{new_url}`\n"
                     f"- Model: `{new_name}`\n"
-                    f"- API Key: `{self._mask_key(new_key)}`\n"
+                    f"- API Key 来源: {api_key_source_note}\n"
+                    f"{api_key_preview_note or ''}"
                     f"- 识图工具: {vision_note}\n"
                     f"- 视频输入: {video_input_note}\n"
                     f"- 持久化: {persist_note}"
@@ -236,7 +271,8 @@ class CustomModelConfigView(View):
         modal = CustomModelConfigModal(
             title="配置 Custom 模型",
             current_url=url,
-            current_api_key=api_key,
+            current_api_key=api_key_default_value,
+            current_api_key_omitted=api_key_omitted,
             current_model_name=model_name,
             current_enable_vision=enable_vision,
             current_enable_video_input=enable_video_input,
