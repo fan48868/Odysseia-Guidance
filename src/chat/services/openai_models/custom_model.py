@@ -17,6 +17,13 @@ from dotenv import set_key
 
 from src import config
 from src.chat.services.moonshot_vision_service import moonshot_vision_service
+from src.chat.utils.custom_model_api_keys import (
+    get_custom_model_api_key_raw_value,
+    persist_custom_model_api_keys_to_file,
+    resolve_custom_model_api_keys,
+    serialize_custom_model_api_keys,
+    split_custom_model_inline_api_keys,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +41,8 @@ class CustomModelClient:
         self._provider_order_offset_by_model: Dict[str, int] = {}
         self.api_key: Optional[str] = None
         self.raw_api_key: Optional[str] = None
+        self._api_key_source_type = "inline"
+        self._api_key_file_path: Optional[str] = None
         self._gateway_options_log_once: set[str] = set()
         runtime_config = self.refresh_from_env()
 
@@ -84,22 +93,7 @@ class CustomModelClient:
 
     @staticmethod
     def _split_api_keys(raw_api_keys: Optional[str]) -> List[str]:
-        raw = str(raw_api_keys or "").strip()
-        if not raw:
-            return []
-
-        parts = re.split(r"[,\n\r\uFF0C]+", raw)
-        normalized: List[str] = []
-        seen = set()
-
-        for part in parts:
-            key = part.strip().strip('"').strip("'").strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            normalized.append(key)
-
-        return normalized
+        return list(split_custom_model_inline_api_keys(raw_api_keys))
 
     @staticmethod
     def _mask_key_tail(api_key: Optional[str]) -> str:
@@ -109,17 +103,38 @@ class CustomModelClient:
 
     @staticmethod
     def _serialize_api_keys(api_keys: List[str]) -> str:
-        return ",".join(str(key).strip() for key in api_keys if str(key).strip())
+        return serialize_custom_model_api_keys(api_keys)
 
     @staticmethod
     def _get_env_path() -> str:
         return os.path.join(config.BASE_DIR, ".env")
 
-    def _apply_api_key_state(self, api_keys: List[str], *, active_index: int = 0) -> str:
+    def _apply_api_key_state(
+        self,
+        api_keys: List[str],
+        *,
+        active_index: int = 0,
+        raw_api_key_source: Optional[str] = None,
+        source_type: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> str:
         normalized_keys = self._split_api_keys(self._serialize_api_keys(api_keys))
         serialized_api_keys = self._serialize_api_keys(normalized_keys)
         self._api_keys = normalized_keys
-        self.raw_api_key = serialized_api_keys or None
+
+        if raw_api_key_source is not None:
+            normalized_source = str(raw_api_key_source or "").strip()
+            self.raw_api_key = normalized_source or None
+        elif self.raw_api_key is None:
+            self.raw_api_key = serialized_api_keys or None
+
+        if source_type is not None:
+            normalized_source_type = str(source_type or "").strip().lower()
+            self._api_key_source_type = normalized_source_type or "inline"
+
+        if file_path is not None:
+            normalized_file_path = str(file_path or "").strip()
+            self._api_key_file_path = normalized_file_path or None
 
         if not normalized_keys:
             self._active_api_key_index = 0
@@ -164,29 +179,59 @@ class CustomModelClient:
         lowered_error_text = str(combined_error_text or "").lower()
         return status_code == 402 or "402 payment required" in lowered_error_text
 
-    def _sync_api_key_state(self, raw_api_key: Optional[str]) -> List[str]:
-        keys = self._split_api_keys(raw_api_key)
+    def _sync_api_key_state(
+        self,
+        api_keys: List[str],
+        *,
+        raw_api_key_source: Optional[str] = None,
+        source_type: Optional[str] = None,
+        file_path: Optional[str] = None,
+    ) -> List[str]:
+        keys = self._split_api_keys(self._serialize_api_keys(api_keys))
         current_key: Optional[str] = None
+        normalized_source = str(raw_api_key_source or "").strip()
 
         if self._api_keys and 0 <= self._active_api_key_index < len(self._api_keys):
             current_key = self._api_keys[self._active_api_key_index]
 
         if not keys:
-            self._apply_api_key_state([], active_index=0)
+            self._apply_api_key_state(
+                [],
+                active_index=0,
+                raw_api_key_source=normalized_source or None,
+                source_type=source_type,
+                file_path=file_path,
+            )
             return self._api_keys
+
+        if normalized_source and self.raw_api_key == normalized_source and self._api_keys:
+            reordered_keys = [key for key in self._api_keys if key in keys]
+            reordered_keys.extend(key for key in keys if key not in reordered_keys)
+            keys = reordered_keys
 
         if current_key in keys:
             active_index = keys.index(current_key)
         else:
             active_index = 0
 
-        self._apply_api_key_state(keys, active_index=active_index)
+        self._apply_api_key_state(
+            keys,
+            active_index=active_index,
+            raw_api_key_source=normalized_source or None,
+            source_type=source_type,
+            file_path=file_path,
+        )
         return self._api_keys
 
     def _get_active_api_key_snapshot(
         self, runtime_config: Dict[str, Any]
     ) -> Tuple[str, int, int]:
-        keys = self._sync_api_key_state(runtime_config.get("api_key"))
+        keys = self._sync_api_key_state(
+            list(runtime_config.get("api_keys") or []),
+            raw_api_key_source=runtime_config.get("api_key_source_value"),
+            source_type=runtime_config.get("api_key_source_type"),
+            file_path=runtime_config.get("api_key_file_path"),
+        )
         if not keys:
             return "", 0, 0
 
@@ -228,7 +273,33 @@ class CustomModelClient:
                 )
                 if runtime_config is not None:
                     runtime_config["api_key"] = serialized_api_keys
-                persisted = self._persist_api_keys_to_env(serialized_api_keys)
+                    runtime_config["api_keys"] = list(self._api_keys)
+                source_type = str(
+                    (runtime_config or {}).get("api_key_source_type")
+                    or self._api_key_source_type
+                ).lower()
+                if source_type == "file":
+                    file_path = str(
+                        (runtime_config or {}).get("api_key_file_path")
+                        or self._api_key_file_path
+                        or ""
+                    ).strip()
+                    try:
+                        persist_custom_model_api_keys_to_file(file_path, self._api_keys)
+                        persisted = True
+                        persist_note: Any = f"file:{file_path}"
+                    except Exception as exc:
+                        persisted = False
+                        persist_note = f"file_failed:{type(exc).__name__}"
+                        log.warning(
+                            "[Custom] Failed to persist rotated API key order to file %s: %s",
+                            file_path or "<empty>",
+                            exc,
+                            exc_info=True,
+                        )
+                else:
+                    persisted = self._persist_api_keys_to_env(serialized_api_keys)
+                    persist_note = persisted
                 next_key = self.api_key or ""
                 log.warning(
                     "[Custom] Key ...%s hit 402 Payment Required, moved it to the end and switched to key ...%s (%s/%s) | persisted=%s | reason=%s",
@@ -236,16 +307,15 @@ class CustomModelClient:
                     self._mask_key_tail(next_key),
                     next_index + 1,
                     len(self._api_keys),
-                    persisted,
+                    persist_note,
                     reason_preview,
                 )
                 return True
 
             self.api_key = active_key
             if runtime_config is not None:
-                runtime_config["api_key"] = self.raw_api_key or self._serialize_api_keys(
-                    self._api_keys
-                )
+                runtime_config["api_key"] = self._serialize_api_keys(self._api_keys)
+                runtime_config["api_keys"] = list(self._api_keys)
             log.info(
                 "[Custom] Key ...%s hit 402 Payment Required, but active key is already ...%s; will retry with the current active key.",
                 self._mask_key_tail(failed_api_key),
@@ -256,10 +326,24 @@ class CustomModelClient:
     @classmethod
     def get_runtime_config(cls) -> Dict[str, Any]:
         base_url = str(os.environ.get("CUSTOM_MODEL_URL", "") or "").strip()
-        api_key = (
-            str(os.environ.get("CUSTOM_MODEL_API_KEY", "") or "").strip()
-            or str(os.environ.get("CUSTON_MODEL_API_KEY", "") or "").strip()
+        raw_api_key = get_custom_model_api_key_raw_value(
+            primary_env_name=cls._PRIMARY_API_KEY_ENV_NAME,
+            legacy_env_name=cls._LEGACY_API_KEY_ENV_NAME,
         )
+        api_key_resolution_error: Optional[str] = None
+        resolved_api_keys: List[str] = []
+        api_key_source_type = "inline"
+        api_key_file_path: Optional[str] = None
+
+        try:
+            resolved_api_key_config = resolve_custom_model_api_keys(raw_api_key)
+            resolved_api_keys = list(resolved_api_key_config.api_keys)
+            api_key_source_type = resolved_api_key_config.source_type
+            api_key_file_path = resolved_api_key_config.file_path
+        except ValueError as exc:
+            api_key_resolution_error = str(exc)
+
+        api_key = cls._serialize_api_keys(resolved_api_keys)
         model_name = str(os.environ.get("CUSTOM_MODEL_NAME", "") or "").strip()
         enable_vision = cls._normalize_bool_flag(
             os.environ.get("CUSTOM_MODEL_ENABLE_VISION")
@@ -295,6 +379,11 @@ class CustomModelClient:
         return {
             "base_url": base_url,
             "api_key": api_key,
+            "api_keys": resolved_api_keys,
+            "api_key_source_type": api_key_source_type,
+            "api_key_source_value": raw_api_key,
+            "api_key_file_path": api_key_file_path,
+            "api_key_error": api_key_resolution_error,
             "model_name": model_name,
             "enable_vision": enable_vision,
             "enable_video_input": enable_video_input,
@@ -305,8 +394,14 @@ class CustomModelClient:
 
     def refresh_from_env(self) -> Dict[str, Any]:
         runtime_config = self.get_runtime_config()
-        self.raw_api_key = runtime_config["api_key"] or None
-        self._sync_api_key_state(self.raw_api_key)
+        effective_api_keys = self._sync_api_key_state(
+            list(runtime_config.get("api_keys") or []),
+            raw_api_key_source=runtime_config.get("api_key_source_value"),
+            source_type=runtime_config.get("api_key_source_type"),
+            file_path=runtime_config.get("api_key_file_path"),
+        )
+        runtime_config["api_keys"] = list(effective_api_keys)
+        runtime_config["api_key"] = self._serialize_api_keys(effective_api_keys)
         self.base_url = runtime_config["base_url"] or None
         self.model_name = runtime_config["model_name"] or None
         self.enable_vision = bool(runtime_config["enable_vision"])
@@ -967,9 +1062,17 @@ class CustomModelClient:
         if runtime_config is None:
             runtime_config = self.refresh_from_env()
 
+        api_key_error = str(runtime_config.get("api_key_error", "") or "").strip()
+        if api_key_error:
+            log.warning(
+                "请求使用 custom 但 CUSTOM_MODEL_API_KEY 无法解析：%s",
+                api_key_error,
+            )
+            return api_key_error
+
         if (
             runtime_config["base_url"]
-            and runtime_config["api_key"]
+            and runtime_config.get("api_keys")
             and runtime_config["model_name"]
         ):
             return None

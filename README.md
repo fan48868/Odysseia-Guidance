@@ -157,9 +157,26 @@ MOONSHOT_URL=""
 MOONSHOT_API_KEY=""   # 支持多个key轮换
 
 CUSTOM_MODEL_URL=''   # 支持自定义openai格式模型，可在聊天设置中热切换
-CUSTOM_MODEL_API_KEY=''
+CUSTOM_MODEL_API_KEY=''   # 可直接填写 key，或填写 /data/CUSTOM_MODEL_API_KEY.json（会自动映射到 /app/data）
 CUSTOM_MODEL_NAME=''
 CUSTOM_MODEL_ENABLE_VISION='true'   # 启动custom外置识图功能
+
+`CUSTOM_MODEL_API_KEY` 支持两种写法：
+
+- 直接填写单个 key，或用逗号/换行填写多个 key
+- 填写 `/data/*.json` 文件路径，例如 `/data/CUSTOM_MODEL_API_KEY.json`
+- 运行时会自动映射到 `/app/data/*.json`，适配当前 `docker-compose` 的挂载方式
+
+文件模式 JSON 格式如下：
+
+```json
+{
+  "api_keys": [
+    "vck_xxx",
+    "vck_yyy"
+  ]
+}
+```
 
 # 功能开关
 CHAT_ENABLED=True
