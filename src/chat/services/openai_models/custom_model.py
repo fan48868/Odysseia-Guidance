@@ -16,6 +16,10 @@ from PIL import Image
 from dotenv import set_key
 
 from src import config
+from src.chat.services.kimi_gateway_provider_selector import (
+    KimiGatewayProviderSelectorService,
+    ProviderSelection,
+)
 from src.chat.services.moonshot_vision_service import moonshot_vision_service
 from src.chat.utils.custom_model_api_keys import (
     get_custom_model_api_key_raw_value,
@@ -37,8 +41,7 @@ class CustomModelClient:
         self._api_keys: List[str] = []
         self._active_api_key_index = 0
         self._key_rotation_lock = asyncio.Lock()
-        self._provider_order_rotation_lock = asyncio.Lock()
-        self._provider_order_offset_by_model: Dict[str, int] = {}
+        self._kimi_gateway_provider_selector = KimiGatewayProviderSelectorService()
         self.api_key: Optional[str] = None
         self.raw_api_key: Optional[str] = None
         self._api_key_source_type = "inline"
@@ -437,39 +440,6 @@ class CustomModelClient:
             return ""
 
         return model.split("/", 1)[0].strip()
-
-    async def _get_rotated_provider_order(
-        self, *, model_key: str, base_order: List[str]
-    ) -> List[str]:
-        if not base_order:
-            return []
-
-        normalized_key = str(model_key or "").strip().lower()
-        if not normalized_key:
-            return list(base_order)
-
-        async with self._provider_order_rotation_lock:
-            offset = self._provider_order_offset_by_model.get(normalized_key, 0)
-
-        normalized_offset = offset % len(base_order)
-        return base_order[normalized_offset:] + base_order[:normalized_offset]
-
-    async def _advance_rotated_provider_order(
-        self, *, model_key: str, base_order: List[str]
-    ) -> List[str]:
-        if not base_order:
-            return []
-
-        normalized_key = str(model_key or "").strip().lower()
-        if not normalized_key:
-            return list(base_order)
-
-        async with self._provider_order_rotation_lock:
-            current_offset = self._provider_order_offset_by_model.get(normalized_key, 0)
-            next_offset = (current_offset + 1) % len(base_order)
-            self._provider_order_offset_by_model[normalized_key] = next_offset
-
-        return base_order[next_offset:] + base_order[:next_offset]
 
     @staticmethod
     def _has_meaningful_sse_value(
@@ -1261,8 +1231,11 @@ class CustomModelClient:
             return None
 
         message: Dict[str, Any] = {"role": "assistant", "content": final_content}
+        if final_reasoning:
+            message["reasoning_content"] = final_reasoning
         if final_tool_calls:
             message["tool_calls"] = final_tool_calls
+            message.setdefault("reasoning_content", "")
 
         final_finish_reason = latest_finish_reason or (
             "tool_calls" if final_tool_calls else "stop"
@@ -1285,6 +1258,49 @@ class CustomModelClient:
             result["usage"] = usage_payload
 
         return result
+
+    @classmethod
+    def _parse_chat_completion_response_body(
+        cls, response: httpx.Response
+    ) -> Optional[Dict[str, Any]]:
+        if cls.is_sse_chat_completion_response(response):
+            return cls.parse_streaming_chat_completion_body(response.text or "")
+
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        if isinstance(payload, dict):
+            return payload
+        return None
+
+    @classmethod
+    def _extract_output_units_from_result(cls, result: Optional[Dict[str, Any]]) -> int:
+        if not isinstance(result, dict):
+            return 1
+
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return 1
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            return 1
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            return 1
+
+        content = message.get("content")
+        extracted_text = cls._extract_text_from_openai_content(content)
+        if not extracted_text and isinstance(content, str):
+            extracted_text = content.strip()
+        return max(len(extracted_text), 1)
+
+    @staticmethod
+    def _should_penalize_gateway_provider_response(status_code: int) -> bool:
+        return status_code == 408 or status_code == 429 or 500 <= status_code < 600
 
     async def send(
         self,
@@ -1334,21 +1350,21 @@ class CustomModelClient:
         )
         is_vercel_gateway = "ai-gateway.vercel.sh" in api_url.lower()
         is_kimi_k2_5_model = normalized_request_model == "moonshotai/kimi-k2.5"
-        kimi_k2_5_provider_order = [
-            "moonshotai",
-            "fireworks",
-            "togetherai",
-            "novita",
-            "bedrock",
-
-        ]
-        active_kimi_provider_order = list(kimi_k2_5_provider_order)
-        if is_kimi_k2_5_model:
-            active_kimi_provider_order = await self._get_rotated_provider_order(
-                model_key=normalized_request_model,
-                base_order=kimi_k2_5_provider_order,
+        selected_gateway_provider: Optional[ProviderSelection] = None
+        if is_vercel_gateway and is_kimi_k2_5_model:
+            selected_gateway_provider = (
+                await self._kimi_gateway_provider_selector.select_provider()
+            )
+            log.info(
+                "[Custom] 已选择 Kimi Gateway 供应商 | model=%s | 供应商=%s | 阶段=%s | 分数=%.6f | url=%s",
+                request_model_name,
+                selected_gateway_provider.provider_name,
+                selected_gateway_provider.stage,
+                selected_gateway_provider.effective_score,
+                api_url,
             )
         provider_timeout_injected = False
+        provider_only_injected = False
         provider_order_injected = False
 
         if is_vercel_gateway:
@@ -1369,19 +1385,30 @@ class CustomModelClient:
                 byok_timeouts = {}
 
             if gateway_provider_timeout_ms > 0:
-                if is_kimi_k2_5_model:
-                    for provider_name in kimi_k2_5_provider_order:
-                        if provider_name not in byok_timeouts:
-                            byok_timeouts[provider_name] = gateway_provider_timeout_ms
-                            provider_timeout_injected = True
+                if selected_gateway_provider is not None:
+                    selected_timeout = byok_timeouts.get(
+                        selected_gateway_provider.provider_name,
+                        gateway_provider_timeout_ms,
+                    )
+                    byok_timeouts = {
+                        selected_gateway_provider.provider_name: selected_timeout
+                    }
+                    provider_timeout_injected = True
                 elif gateway_provider_name and gateway_provider_name not in byok_timeouts:
                     byok_timeouts[gateway_provider_name] = gateway_provider_timeout_ms
                     provider_timeout_injected = True
 
-            if is_kimi_k2_5_model:
+            if selected_gateway_provider is not None:
+                selected_provider_name = selected_gateway_provider.provider_name
+                existing_only = gateway_options.get("only")
+                selected_only = [selected_provider_name]
+                if existing_only != selected_only:
+                    gateway_options["only"] = selected_only
+                    provider_only_injected = True
+
                 existing_order = gateway_options.get("order")
-                if existing_order != active_kimi_provider_order:
-                    gateway_options["order"] = list(active_kimi_provider_order)
+                if existing_order != selected_only:
+                    gateway_options["order"] = selected_only
                     provider_order_injected = True
 
             provider_timeouts["byok"] = byok_timeouts
@@ -1389,7 +1416,11 @@ class CustomModelClient:
             provider_options["gateway"] = gateway_options
             request_payload["providerOptions"] = provider_options
 
-            if provider_timeout_injected or provider_order_injected:
+            if (
+                provider_timeout_injected
+                or provider_only_injected
+                or provider_order_injected
+            ):
                 order_for_log = gateway_options.get("order")
                 if isinstance(order_for_log, list):
                     order_key = ",".join(str(item) for item in order_for_log)
@@ -1402,8 +1433,24 @@ class CustomModelClient:
                 if log_key not in self._gateway_options_log_once:
                     self._gateway_options_log_once.add(log_key)
                     log.info(
-                        "[Custom] Injected AI Gateway provider options | model=%s | order=%s | timeout_ms=%s | url=%s",
+                        "[Custom] 已注入 AI Gateway 供应商配置 | model=%s | 供应商=%s | 阶段=%s | 分数=%.6f | only=%s | order=%s | timeout_ms=%s | url=%s",
                         request_model_name,
+                        (
+                            selected_gateway_provider.provider_name
+                            if selected_gateway_provider is not None
+                            else None
+                        ),
+                        (
+                            selected_gateway_provider.stage
+                            if selected_gateway_provider is not None
+                            else None
+                        ),
+                        (
+                            selected_gateway_provider.effective_score
+                            if selected_gateway_provider is not None
+                            else 0.0
+                        ),
+                        gateway_options.get("only"),
                         gateway_options.get("order"),
                         gateway_provider_timeout_ms,
                         api_url,
@@ -1465,6 +1512,18 @@ class CustomModelClient:
                                 and attempt < max_key_attempts - 1
                             ):
                                 continue
+
+                        if selected_gateway_provider is not None:
+                            if self._should_penalize_gateway_provider_response(
+                                current_response.status_code
+                            ):
+                                await self._kimi_gateway_provider_selector.report_failure(
+                                    selected_gateway_provider.provider_name
+                                )
+                            else:
+                                await self._kimi_gateway_provider_selector.release_provider(
+                                    selected_gateway_provider.provider_name
+                                )
 
                         current_response.raise_for_status()
 
@@ -1626,20 +1685,39 @@ class CustomModelClient:
                         current_response,
                         "\n".join(body_lines),
                     )
+                    successful_request_elapsed_seconds = loop.time() - request_started_at
+
+                    if selected_gateway_provider is not None:
+                        parsed_result = self._parse_chat_completion_response_body(
+                            response
+                        )
+                        output_units = self._extract_output_units_from_result(
+                            parsed_result
+                        )
+                        await self._kimi_gateway_provider_selector.report_success(
+                            selected_gateway_provider.provider_name,
+                            elapsed_seconds=successful_request_elapsed_seconds,
+                            output_units=output_units,
+                        )
+                        measured_unit_cost = successful_request_elapsed_seconds / max(
+                            output_units, 1
+                        )
+                        log.info(
+                            "[Custom] Kimi Gateway 供应商测速结果 | model=%s | 供应商=%s | 阶段=%s | 总耗时=%.2fs | 输出字数=%s | 每字耗时=%.6f | status=%s",
+                            request_model_name,
+                            selected_gateway_provider.provider_name,
+                            selected_gateway_provider.stage,
+                            successful_request_elapsed_seconds,
+                            output_units,
+                            measured_unit_cost,
+                            response.status_code,
+                        )
                     break
             except httpx.RequestError as exc:
                 elapsed_total_seconds = loop.time() - request_started_at
-                next_kimi_provider_order: Optional[List[str]] = None
-                if is_vercel_gateway and is_kimi_k2_5_model:
-                    next_kimi_provider_order = await self._advance_rotated_provider_order(
-                        model_key=normalized_request_model,
-                        base_order=kimi_k2_5_provider_order,
-                    )
-                    log.warning(
-                        "[Custom] Rotated provider order for retry after network error | model=%s | from=%s | to=%s",
-                        request_model_name,
-                        active_kimi_provider_order,
-                        next_kimi_provider_order,
+                if selected_gateway_provider is not None:
+                    await self._kimi_gateway_provider_selector.report_failure(
+                        selected_gateway_provider.provider_name
                     )
 
                 log.warning(
@@ -1648,7 +1726,7 @@ class CustomModelClient:
                     "first_token_timeout=%.1fs | idle_timeout=%.1fs | "
                     "received_first_meaningful_token=%s | body_lines=%s | meaningful_lines=%s | "
                     "used_streaming=%s | saw_non_sse_payload=%s | samples=%s | model=%s | url=%s | "
-                    "order=%s | next_order=%s | "
+                    "provider=%s | stage=%s | "
                     "exc_type=%s | exc=%s",
                     attempt + 1,
                     max_key_attempts,
@@ -1668,8 +1746,16 @@ class CustomModelClient:
                     sse_line_samples if "sse_line_samples" in locals() else [],
                     str(request_payload.get("model", "")),
                     api_url,
-                    active_kimi_provider_order if is_kimi_k2_5_model else None,
-                    next_kimi_provider_order,
+                    (
+                        selected_gateway_provider.provider_name
+                        if selected_gateway_provider is not None
+                        else None
+                    ),
+                    (
+                        selected_gateway_provider.stage
+                        if selected_gateway_provider is not None
+                        else None
+                    ),
                     type(exc).__name__,
                     exc,
                 )
@@ -1687,5 +1773,20 @@ class CustomModelClient:
             "used_model_name": str(request_payload.get("model", "")),
             "stream_enabled": used_streaming,
             "stream_idle_timeout_seconds": idle_timeout_seconds,
+            "selected_gateway_provider": (
+                selected_gateway_provider.provider_name
+                if selected_gateway_provider is not None
+                else None
+            ),
+            "selected_gateway_provider_stage": (
+                selected_gateway_provider.stage
+                if selected_gateway_provider is not None
+                else None
+            ),
+            "selected_gateway_provider_score": (
+                selected_gateway_provider.effective_score
+                if selected_gateway_provider is not None
+                else None
+            ),
             "skip_custom_site_for_this_turn": False,
         }

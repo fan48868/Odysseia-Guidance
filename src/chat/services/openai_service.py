@@ -1507,7 +1507,7 @@ class OpenAIService:
                 content = response_message.get("content") or ""
                 tool_calls = response_message.get("tool_calls")
 
-                if reasoning_content:
+                if reasoning_content and not is_custom_model:
                     log.info(
                         f"--- [{channel_label}] 思考过程 ---\n{reasoning_content}\n-----------------------------"
                     )

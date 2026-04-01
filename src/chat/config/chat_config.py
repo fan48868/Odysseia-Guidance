@@ -188,7 +188,7 @@ MODEL_GENERATION_CONFIG = {
         "temperature": 0.6,
     },
     "custom":{
-        "temperature": 0.95,
+        "temperature": 1,
     },
 
     # 你可以在这里为其他模型添加更多自定义配置

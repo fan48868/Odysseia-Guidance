@@ -94,6 +94,13 @@ def _truncate_decimal(value: Any, digits: int = 2) -> Any:
         return value
 
 
+def _parse_decimal(value: Any) -> Optional[Decimal]:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
 def _truncate_custom_credits(data: Any) -> Any:
     """
     Custom(AI Gateway) 的 /credits 返回会透传给模型，这里直接截断原始 JSON。
@@ -106,6 +113,27 @@ def _truncate_custom_credits(data: Any) -> Any:
     if "total_used" in data:
         data["total_used"] = _truncate_decimal(data.get("total_used"), digits=2)
     return data
+
+
+def _sum_custom_gateway_balances(data_items: List[Any]) -> Optional[str]:
+    total = Decimal("0")
+    has_balance = False
+
+    for data in data_items:
+        if not isinstance(data, dict):
+            continue
+
+        balance = _parse_decimal(data.get("balance"))
+        if balance is None:
+            continue
+
+        total += balance
+        has_balance = True
+
+    if not has_balance:
+        return None
+
+    return _truncate_decimal(total, digits=2)
 
 
 def _get_custom_api_key() -> str:
@@ -380,6 +408,7 @@ async def _get_custom_gateway_balance(
             )
 
         data = _truncate_custom_credits(_parse_json_response(response))
+        total_balance = _sum_custom_gateway_balances([data])
 
         # Custom 成功返回：返回 AI Gateway /credits 的原始 JSON，金额已截断为 2 位小数。
         return _build_payload(
@@ -387,6 +416,7 @@ async def _get_custom_gateway_balance(
             provider=provider,
             model=current_model,
             data=data,
+            total_balance=total_balance,
             单位="美元",
         )
 
@@ -524,6 +554,9 @@ async def _get_custom_gateway_balance_multi(
 
         success_count = sum(1 for result in results if result.get("ok"))
         failed_count = len(results) - success_count
+        total_balance = _sum_custom_gateway_balances(
+            [result.get("data") for result in results if result.get("ok")]
+        )
 
         payload = _build_payload(
             ok=success_count > 0,
@@ -533,6 +566,7 @@ async def _get_custom_gateway_balance_multi(
             success_count=success_count,
             failed_count=failed_count,
             results=results,
+            total_balance=total_balance,
             单位="美元",
         )
 
