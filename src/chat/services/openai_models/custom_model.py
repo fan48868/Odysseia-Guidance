@@ -1231,8 +1231,11 @@ class CustomModelClient:
             return None
 
         message: Dict[str, Any] = {"role": "assistant", "content": final_content}
+        if final_reasoning:
+            message["reasoning_content"] = final_reasoning
         if final_tool_calls:
             message["tool_calls"] = final_tool_calls
+            message.setdefault("reasoning_content", "")
 
         final_finish_reason = latest_finish_reason or (
             "tool_calls" if final_tool_calls else "stop"
