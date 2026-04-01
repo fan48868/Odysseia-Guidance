@@ -160,7 +160,7 @@ class KimiGatewayProviderSelectorService:
 
         self._warmup_results_logged = True
         scoreboard = " | ".join(self._build_scoreboard_entries_locked())
-        log.info("[KimiGateway] Warmup completed | scoreboard=%s", scoreboard)
+        log.info("[KimiGateway] 供应商预热完成，当前成绩榜：%s", scoreboard)
 
     def _build_scoreboard_entries_locked(self) -> List[str]:
         ordered_states = [

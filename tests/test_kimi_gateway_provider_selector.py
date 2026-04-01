@@ -167,7 +167,7 @@ async def test_selector_logs_scoreboard_when_warmup_completes(caplog: pytest.Log
                 output_units=1,
             )
 
-    assert "Warmup completed" in caplog.text
+    assert "供应商预热完成" in caplog.text
     for provider_name in service.PROVIDER_NAMES:
         assert provider_name in caplog.text
 
@@ -310,9 +310,9 @@ async def test_custom_model_send_injects_single_provider_options_for_kimi_gatewa
     moonshot_state = client._kimi_gateway_provider_selector._provider_states["moonshotai"]
     assert moonshot_state.last_output_units == 7
     assert moonshot_state.current_unit_cost is not None
-    assert "Selected Kimi gateway provider" in caplog.text
-    assert "Kimi gateway provider result" in caplog.text
-    assert "provider=moonshotai" in caplog.text
+    assert "已选择 Kimi Gateway 供应商" in caplog.text
+    assert "Kimi Gateway 供应商测速结果" in caplog.text
+    assert "供应商=moonshotai" in caplog.text
 
 
 @pytest.mark.asyncio

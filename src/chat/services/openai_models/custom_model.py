@@ -1359,7 +1359,7 @@ class CustomModelClient:
                 await self._kimi_gateway_provider_selector.select_provider()
             )
             log.info(
-                "[Custom] Selected Kimi gateway provider | model=%s | provider=%s | stage=%s | score=%.6f | url=%s",
+                "[Custom] 已选择 Kimi Gateway 供应商 | model=%s | 供应商=%s | 阶段=%s | 分数=%.6f | url=%s",
                 request_model_name,
                 selected_gateway_provider.provider_name,
                 selected_gateway_provider.stage,
@@ -1436,7 +1436,7 @@ class CustomModelClient:
                 if log_key not in self._gateway_options_log_once:
                     self._gateway_options_log_once.add(log_key)
                     log.info(
-                        "[Custom] Injected AI Gateway provider options | model=%s | provider=%s | stage=%s | score=%.6f | only=%s | order=%s | timeout_ms=%s | url=%s",
+                        "[Custom] 已注入 AI Gateway 供应商配置 | model=%s | 供应商=%s | 阶段=%s | 分数=%.6f | only=%s | order=%s | timeout_ms=%s | url=%s",
                         request_model_name,
                         (
                             selected_gateway_provider.provider_name
@@ -1706,7 +1706,7 @@ class CustomModelClient:
                             output_units, 1
                         )
                         log.info(
-                            "[Custom] Kimi gateway provider result | model=%s | provider=%s | stage=%s | elapsed=%.2fs | output_units=%s | unit_cost=%.6f | status=%s",
+                            "[Custom] Kimi Gateway 供应商测速结果 | model=%s | 供应商=%s | 阶段=%s | 总耗时=%.2fs | 输出单位=%s | 单位耗时=%.6f | status=%s",
                             request_model_name,
                             selected_gateway_provider.provider_name,
                             selected_gateway_provider.stage,
