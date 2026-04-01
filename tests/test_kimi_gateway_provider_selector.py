@@ -224,7 +224,7 @@ async def test_selector_prefers_fastest_provider_but_can_sample_others_and_penal
     assert post_penalty_selection.provider_name == "novita"
 
 
-def test_extract_output_units_prefers_tokens_then_text_and_minimum_one():
+def test_extract_output_units_uses_output_text_length_and_minimum_one():
     assert (
         CustomModelClient._extract_output_units_from_result(
             {
@@ -232,7 +232,7 @@ def test_extract_output_units_prefers_tokens_then_text_and_minimum_one():
                 "choices": [{"message": {"content": "ignored"}}],
             }
         )
-        == 11
+        == len("ignored")
     )
     assert (
         CustomModelClient._extract_output_units_from_result(
@@ -308,11 +308,12 @@ async def test_custom_model_send_injects_single_provider_options_for_kimi_gatewa
     assert result["selected_gateway_provider_stage"] == "warmup"
 
     moonshot_state = client._kimi_gateway_provider_selector._provider_states["moonshotai"]
-    assert moonshot_state.last_output_units == 7
+    assert moonshot_state.last_output_units == len("hello")
     assert moonshot_state.current_unit_cost is not None
     assert "已选择 Kimi Gateway 供应商" in caplog.text
     assert "Kimi Gateway 供应商测速结果" in caplog.text
     assert "供应商=moonshotai" in caplog.text
+    assert "输出字数=5" in caplog.text
 
 
 @pytest.mark.asyncio

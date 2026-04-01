@@ -1277,12 +1277,6 @@ class CustomModelClient:
         if not isinstance(result, dict):
             return 1
 
-        usage = result.get("usage")
-        if isinstance(usage, dict):
-            completion_tokens = usage.get("completion_tokens")
-            if isinstance(completion_tokens, int) and completion_tokens > 0:
-                return completion_tokens
-
         choices = result.get("choices")
         if not isinstance(choices, list) or not choices:
             return 1
@@ -1706,7 +1700,7 @@ class CustomModelClient:
                             output_units, 1
                         )
                         log.info(
-                            "[Custom] Kimi Gateway 供应商测速结果 | model=%s | 供应商=%s | 阶段=%s | 总耗时=%.2fs | 输出单位=%s | 单位耗时=%.6f | status=%s",
+                            "[Custom] Kimi Gateway 供应商测速结果 | model=%s | 供应商=%s | 阶段=%s | 总耗时=%.2fs | 输出字数=%s | 每字耗时=%.6f | status=%s",
                             request_model_name,
                             selected_gateway_provider.provider_name,
                             selected_gateway_provider.stage,

@@ -174,10 +174,10 @@ class KimiGatewayProviderSelectorService:
         )
         return [
             (
-                f"{state.provider_name}:effective={self._get_effective_score_locked(state):.6f}"
-                f",unit={float(state.current_unit_cost or 0.0):.6f}"
-                f",penalty={state.failure_penalty_seconds:.2f}"
-                f",samples={state.warmup_sample_count}"
+                f"{state.provider_name}:综合分={self._get_effective_score_locked(state):.6f}"
+                f",每字耗时={float(state.current_unit_cost or 0.0):.6f}"
+                f",惩罚={state.failure_penalty_seconds:.2f}"
+                f",样本={state.warmup_sample_count}"
             )
             for state in ordered_states
         ]
