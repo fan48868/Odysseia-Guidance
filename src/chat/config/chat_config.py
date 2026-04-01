@@ -57,7 +57,7 @@ CUSTOM_GEMINI_ENDPOINTS = {
         "api_key": os.getenv("CUSTOM_GEMINI_API_KEY"),
         "model_name": "gemini-2.5-flash",  # 该端点实际对应的模型名称
     },
-    "gemini-3.1-pro-preview-custom": {
+    "gemini-3.1-pro-preview": {
         "base_url": os.getenv("CUSTOM_GEMINI_URL"),
         "api_key": os.getenv("CUSTOM_GEMINI_API_KEY"),
         "model_name": "gemini-3.1-pro-preview",
