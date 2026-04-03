@@ -55,6 +55,7 @@ def _build_runtime_config(
     model_name: str = "moonshotai/kimi-k2.5",
     gateway_provider_name: str = "",
     gateway_provider_timeout_ms: int = 4000,
+    accept_encoding: Optional[str] = "identity",
 ) -> Dict[str, Any]:
     return {
         "base_url": base_url,
@@ -70,6 +71,7 @@ def _build_runtime_config(
         "gateway_provider_timeout_ms": gateway_provider_timeout_ms,
         "gateway_provider_name": gateway_provider_name,
         "stream_idle_timeout_seconds": 5.0,
+        "accept_encoding": accept_encoding,
     }
 
 
@@ -151,6 +153,26 @@ def _build_json_response(
 
 def _capture_request_payload(request: httpx.Request, captured_payloads: List[Dict[str, Any]]):
     captured_payloads.append(json.loads(request.content.decode("utf-8")))
+
+
+def test_custom_model_runtime_config_defaults_accept_encoding_to_identity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("CUSTOM_MODEL_ACCEPT_ENCODING", raising=False)
+
+    runtime_config = CustomModelClient.get_runtime_config()
+
+    assert runtime_config["accept_encoding"] == "identity"
+
+
+def test_custom_model_runtime_config_allows_httpx_default_accept_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("CUSTOM_MODEL_ACCEPT_ENCODING", "auto")
+
+    runtime_config = CustomModelClient.get_runtime_config()
+
+    assert runtime_config["accept_encoding"] is None
 
 
 @pytest.mark.asyncio
@@ -370,6 +392,40 @@ async def test_custom_model_send_injects_single_provider_options_for_kimi_gatewa
     assert "Kimi Gateway 供应商测速结果" in caplog.text
     assert "供应商=novita" in caplog.text
     assert "输出字数=5" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_custom_model_send_uses_identity_accept_encoding_by_default():
+    client = CustomModelClient()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Accept-Encoding"] == "identity"
+        return _build_sse_response(request)
+
+    runtime_config = _build_runtime_config()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await client.send(
+            http_client=http_client,
+            payload={"model": "moonshotai/kimi-k2.5", "messages": []},
+            runtime_config=runtime_config,
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_model_send_allows_accept_encoding_override():
+    client = CustomModelClient()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Accept-Encoding"] == "gzip"
+        return _build_sse_response(request)
+
+    runtime_config = _build_runtime_config(accept_encoding="gzip")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await client.send(
+            http_client=http_client,
+            payload={"model": "moonshotai/kimi-k2.5", "messages": []},
+            runtime_config=runtime_config,
+        )
 
 
 @pytest.mark.asyncio

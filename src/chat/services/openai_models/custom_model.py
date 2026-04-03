@@ -95,6 +95,17 @@ class CustomModelClient:
         return max(minimum, min(maximum, int(value)))
 
     @staticmethod
+    def _resolve_accept_encoding(raw_value: Optional[str]) -> Optional[str]:
+        normalized = str(raw_value or "").strip()
+        if not normalized:
+            return "identity"
+
+        if normalized.lower() in {"auto", "default", "client-default"}:
+            return None
+
+        return normalized
+
+    @staticmethod
     def _split_api_keys(raw_api_keys: Optional[str]) -> List[str]:
         return list(split_custom_model_inline_api_keys(raw_api_keys))
 
@@ -379,6 +390,9 @@ class CustomModelClient:
                 os.environ.get("CUSTOM_MODEL_STREAM_IDLE_TIMEOUT_SECONDS"),
                 default=5.0,
             )
+        accept_encoding = cls._resolve_accept_encoding(
+            os.environ.get("CUSTOM_MODEL_ACCEPT_ENCODING")
+        )
         return {
             "base_url": base_url,
             "api_key": api_key,
@@ -393,6 +407,7 @@ class CustomModelClient:
             "gateway_provider_timeout_ms": gateway_provider_timeout_ms,
             "gateway_provider_name": gateway_provider_name,
             "stream_idle_timeout_seconds": stream_idle_timeout_seconds,
+            "accept_encoding": accept_encoding,
         }
 
     def refresh_from_env(self) -> Dict[str, Any]:
@@ -418,6 +433,7 @@ class CustomModelClient:
         self.stream_idle_timeout_seconds = float(
             runtime_config["stream_idle_timeout_seconds"]
         )
+        self.accept_encoding = runtime_config.get("accept_encoding")
         return runtime_config
 
     @staticmethod
@@ -1339,6 +1355,9 @@ class CustomModelClient:
         headers = {
             "Content-Type": "application/json",
         }
+        request_accept_encoding = runtime_config.get("accept_encoding")
+        if isinstance(request_accept_encoding, str) and request_accept_encoding.strip():
+            headers["Accept-Encoding"] = request_accept_encoding.strip()
         gateway_provider_timeout_ms = int(
             runtime_config.get("gateway_provider_timeout_ms", 4000) or 4000
         )
@@ -1473,6 +1492,8 @@ class CustomModelClient:
             used_streaming = False
             received_first_meaningful_token = False
             saw_non_sse_payload = False
+            response_content_encoding = "<pending>"
+            response_transfer_encoding = "<pending>"
 
             try:
                 async with http_client.stream(
@@ -1483,6 +1504,12 @@ class CustomModelClient:
                     timeout=request_timeout,
                 ) as current_response:
                     stream_phase = "response_headers_received"
+                    response_content_encoding = (
+                        current_response.headers.get("content-encoding") or "<none>"
+                    )
+                    response_transfer_encoding = (
+                        current_response.headers.get("transfer-encoding") or "<none>"
+                    )
 
                     if current_response.is_error:
                         stream_phase = "error_response_body"
@@ -1724,6 +1751,8 @@ class CustomModelClient:
                     "[Custom] Stream request error | attempt=%s/%s | phase=%s | elapsed=%.2fs | "
                     "net_timeout(connect/read/write/pool)=%.1f/%.1f/%.1f/%.1f | "
                     "first_token_timeout=%.1fs | idle_timeout=%.1fs | "
+                    "request_accept_encoding=%s | response_content_encoding=%s | "
+                    "response_transfer_encoding=%s | "
                     "received_first_meaningful_token=%s | body_lines=%s | meaningful_lines=%s | "
                     "used_streaming=%s | saw_non_sse_payload=%s | samples=%s | model=%s | url=%s | "
                     "provider=%s | stage=%s | "
@@ -1738,6 +1767,9 @@ class CustomModelClient:
                     request_timeout.pool,
                     first_token_timeout_seconds,
                     idle_timeout_seconds,
+                    headers.get("Accept-Encoding", "<httpx-default>"),
+                    response_content_encoding,
+                    response_transfer_encoding,
                     received_first_meaningful_token,
                     body_line_count,
                     meaningful_line_count,
