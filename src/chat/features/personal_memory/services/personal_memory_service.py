@@ -255,59 +255,12 @@ class PersonalMemoryService:
                     if line.strip().startswith("-")
                 ]
 
-        # 条数限制处理：超过2条则让AI精选
+        # 条数限制：超过2条直接截断，不再调用AI筛选
         if len(added_long_lines) > 2:
             log.warning(
-                f"生成的长期记忆条数 ({len(added_long_lines)}) 超过限制 (2条)，请求 AI 筛选最重要的 2 条。"
+                f"生成的长期记忆条数 ({len(added_long_lines)}) 超过限制 (2条)，直接截断前2条。"
             )
-
-            memory_items = [line.lstrip("- ").strip() for line in added_long_lines]
-            memory_list_text = "\n".join([f"{i + 1}. {item}" for i, item in enumerate(memory_items)])
-
-            selection_prompt = (
-                f"你为用户生成了以下 {len(memory_items)} 条长期记忆，但这超过了系统限制（最多保留 2 条）。\n"
-                "请仔细评估，从中筛选出 **最重要、最具深层价值** 的 2 条记忆。\n\n"
-                "**待筛选列表:**\n"
-                f"{memory_list_text}\n\n"
-                "**输出要求:**\n"
-                "1. 只输出筛选后的 2 条内容。\n"
-                "2. 保持原意，不要修改内容。\n"
-                "3. 每条一行，严格以 `- ` 开头。\n"
-                "4. 不要输出任何其他解释性文字。"
-            )
-
-            try:
-                selection_response = await gemini_service.generate_simple_response(
-                    prompt=selection_prompt,
-                    generation_config=GEMINI_SUMMARY_GEN_CONFIG,
-                    model_name=get_summary_model(),
-                )
-
-                if selection_response:
-                    selected_lines = [
-                        line.strip()
-                        for line in selection_response.split("\n")
-                        if line.strip().startswith("-")
-                    ]
-                    if selected_lines:
-                        log.info(f"AI 筛选成功，保留了 {len(selected_lines)} 条记忆。")
-                        added_long_lines = selected_lines[:2]
-                    else:
-                        log.warning("AI 筛选响应格式不符合预期，回退到强制截断。")
-                        added_long_lines = added_long_lines[:2]
-                else:
-                    log.warning("AI 筛选响应为空，回退到强制截断。")
-                    added_long_lines = added_long_lines[:2]
-            except Exception as e:
-                log.error(f"AI 筛选过程发生错误: {e}，回退到强制截断。")
-                added_long_lines = added_long_lines[:2]
-
-        # 去重处理
-        added_long_lines = await self._filter_new_long_memory_lines(
-            user_id=user_id,
-            candidate_lines=added_long_lines,
-            existing_long_texts=existing_long_texts,
-        )
+            added_long_lines = added_long_lines[:2]
 
         # 提取近期动态
         new_recent_match = re.search(
